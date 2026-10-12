@@ -1,0 +1,53 @@
+{
+  "created_at": "2026-10-12T10:44:17.242825+00:00",
+  "selection": "Purposively selected stress cases; not a representative benchmark sample",
+  "parse_settings": {
+    "variants": [
+      "chars_rem"
+    ],
+    "dpi": 300,
+    "attempts": 1
+  },
+  "documents": {
+    "jasyn_710_00_vertical": {
+      "url": "https://huggingface.co/datasets/stockmark/OmniDocBench-JASyn/resolve/main/images/710_00.png",
+      "dataset": "stockmark/OmniDocBench-JASyn",
+      "dataset_card": "https://huggingface.co/datasets/stockmark/OmniDocBench-JASyn",
+      "image": "710_00.png",
+      "reason": "Vertical newspaper: right-to-left columns, mixed horizontal diagrams, Latin acronyms and numbers",
+      "ground_truth": "ground_truth/jasyn_710_00_vertical.json",
+      "license_note": "CC BY 4.0. Dataset card requests evaluation only, no model training/distillation.",
+      "conversion": "Image embedded as A4 PDF, without OCR/text layer",
+      "source_sha256": "bc8116744804f40a51360397775d4ce8a3bb4a5b5dc4898ea22939f3e43ffe87"
+    },
+    "jasyn_746_02_spans": {
+      "url": "https://huggingface.co/datasets/stockmark/OmniDocBench-JASyn/resolve/main/images/746_02.png",
+      "dataset": "stockmark/OmniDocBench-JASyn",
+      "dataset_card": "https://huggingface.co/datasets/stockmark/OmniDocBench-JASyn",
+      "image": "746_02.png",
+      "reason": "Business manual: two tables with 11 row/column spans, chart and parallel sidebars",
+      "ground_truth": "ground_truth/jasyn_746_02_spans.json",
+      "license_note": "CC BY 4.0. Dataset card requests evaluation only, no model training/distillation.",
+      "conversion": "Image embedded as A4 PDF, without OCR/text layer",
+      "source_sha256": "0dac109935902ea28b6f64bb7531c6f7963a08b52eb4f7f2a0d3fa6ec15c3a7a"
+    },
+    "jcs2023_p031_table": {
+      "url": "https://www.j-circ.or.jp/cms/wp-content/uploads/2023/03/JCS2023_fujiyoshi.pdf",
+      "pdf_page_1_based": 31,
+      "printed_page": 31,
+      "reason": "Dense 9-column table with vertical labels and merged first-column groups",
+      "ground_truth": "Embedded text is an unverified hint; table structure inspected visually.",
+      "source_sha256": "0aa1eb7e2ac55f6d8c9d03d551213033c22f93473daa34dacd5caeb8ad012bfe"
+    },
+    "nta2025_tax_form": {
+      "url": "https://www.nta.go.jp/taxes/tetsuzuki/shinsei/annai/hojin/shinkoku/itiran2025/pdf/01-01-s.pdf",
+      "pdf_page_1_based": 1,
+      "reason": "Image-only corporate tax form: tiny text, vertical headings, nested and irregular table cells",
+      "ground_truth": "No embedded text; selected labels checked visually.",
+      "source_sha256": "dcd39af5c697b406f031a6216459f6a4bd5343550780eacc9d938f5b9e2402b1",
+      "conversion": "Original 2481x3508 point page fitted losslessly to A4; source 2481x3508 pixel image retained."
+    }
+  },
+  "jasyn_revision_observed": "73ecb24624682575bd5ebf138026e711589ae5c6",
+  "jasyn_annotation_sha256": "d6ef2b628626d73ae430a548005d872ff83f7477aeeb1441fd3fda8caccd99a8"
+}

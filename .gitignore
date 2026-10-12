@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local benchmark configuration, documents, models and generated results
+benchmark/.env
+benchmark/.browsers/
+benchmark/datagen/io/**
+!benchmark/datagen/io/raw/
+!benchmark/datagen/io/input/
+!benchmark/datagen/io/output/
+!benchmark/datagen/io/**/.gitkeep
