@@ -1,5 +1,6 @@
 pymupdf>=1.26,<2
 pymupdf4llm>=0.0.27,<1
+pymupdf-layout>=1.28,<2
 Pillow>=11,<13
 numpy>=2,<3
 markdown-it-py>=3,<5

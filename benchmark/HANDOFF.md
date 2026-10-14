@@ -41,29 +41,47 @@ Scoring always references the clean original, sends candidate text plus its
 one-page rendered image, and caches JSON judgments. Counts are LLM estimates,
 not verified CER/TEDS. The judge is not yet calibrated on these known failures.
 
-New augmentation version 2 has eight profiles (`scan`, `motion`, `photo`,
-`resolution`, `compression`, `ink`, `warp`, `screen`) × `mild/medium/hard`.
-Default: **24 augmented + original + chars_rem = 26 PDFs per source page**.
-Sidecars save seed, exact effects, geometry matrices/mesh and
-`training_review_required: true`. CPU image processing; no OCR model involved.
+New augmentation version 8 writes **one stacked `aug` page per source page**: every
+effect is applied to the same image, each at its own random level. There are no
+profiles, severities or per-stage files to select. Each knob has one range from the
+mildest useful value to the strongest still-recoverable one — skew 0.5–15°,
+perspective 1.5–15%, curvature 0.8–7.5%, motion 2.5–14 px, resolution 0.22–0.80,
+JPEG 20–86, ink 0.25–0.88, moiré 4–28 — sampled as `mild + (strong-mild) * t` with
+drawn uniformly (`BIAS = 1`) rather than leaning mild. `SPAN = 0.5` halves every range,
+so no knob reaches the strong end of the table and a page cannot stack everything at full
+strength; raise SPAN toward 1.0 for the full documented spread, or BIAS above 1 to favor
+gentle pages again.
+The resolution reducer is commented out in `datagen/augment.py` (version 5 stacked it
+with everything else and destroyed too many pages); re-enabling it means another
+VERSION bump because it also consumes a random draw.
+Default: **aug + original + chars_rem = 3 PDFs per source page**.
+Preparation runs pages of a document through a process pool: `--workers N` (default 4,
+1 = serial), measured 3.7× at 4 workers and independent of the sampled values. Parse
+stays sequential because attempts reload models onto one GPU.
+The prepare manifest in `cache/input/<document>.json` saves seed, exact effects,
+geometry matrices/mesh and `training_review_required: true` per page. CPU image processing; no OCR model involved.
 
-Selecting more pairs appends them. Version-1 manifests/filenames migrate without
-overwriting existing inputs/outputs; missing old variants use the original
-algorithm. Global seed, DPI and source changes still require a fresh IO directory
-or renamed source. Source hash/page/profile/global seed determine randomness;
-severity siblings share the same seed. New filename parsing supports
-`page_0001_scan_medium_attempt1.md` throughout scoring/ranking.
+Existing inputs/outputs are never pruned or overwritten. Manifests from another
+augmentation version are rejected rather than silently mixed with new pixels — prepare
+into a fresh IO directory. Global seed, DPI and source changes still require a fresh
+IO directory or renamed source. Source hash/page/global seed determine randomness.
+Filenames are `page_0001_aug.pdf` / `page_0001_aug_attempt1.md` throughout
+preparation, scoring and ranking. Trade-off to remember: one stacked page per page
+loses the isolated per-condition variants that used to attribute a failure to a single
+defect, and costs roughly the sum of the old stages per page (~16 s/page, 300 DPI CPU).
 
 Research and training recommendations:
 `benchmark/research/document_augmentation.md`. Primary sources include Augraphy,
 Real5-OmniDocBench, Synth-JDoc and Nougat training transforms. Split by source and
 template family before augmentation, preserve verified targets, review legibility,
-and mix clean/mild/medium with a reviewed hard subset. Training gains remain
+and mix clean pages with the low half of each range plus a reviewed strong subset. Training gains remain
 unmeasured; synthetic distortion alone cannot supply new layout/table diversity.
 
 ## Current corpus and evidence — retain it
 
-IO root: `benchmark/datagen/io/japanese-stress-20261012/` (ignored by Git).
+The four stress PDFs now sit in the shared raw corpus `benchmark/datagen/io/raw/`
+(ignored by Git); the per-dataset IO directory and its run artifacts were removed
+on 2026-10-14, and `premade/japanese_stress_setup.py` rebuilds the PDFs on demand.
 
 | Document folder | Page |
 | --- | --- |
@@ -78,7 +96,9 @@ IO root: `benchmark/datagen/io/japanese-stress-20261012/` (ignored by Git).
 2481×3508-point media box around a same-sized pixel image; fitting it to A4 avoids
 a 151 MP render. JASyn is for evaluation only per its card, not fine-tuning.
 
-Eight initial outputs are under `output/<document>/{mineru,paddle}/chars_rem/`.
+Eight initial outputs were written as `output/<document>/{mineru,paddle}/chars_rem/`
+before the 2026-10-14 layout change; that shape is now
+`output/{mineru,paddle}/<document>/page_0001_chars_rem_attempt1.md`.
 These used MinerU Standard and PP-StructureV3 with Japanese-capable shared
 PP-OCRv5. Do not pool them with stronger profiles as though the settings match.
 Initial findings/inspection tools are in `findings.json`, `observations.json`,
@@ -99,12 +119,12 @@ Nine stronger-profile reruns are under `fairness_audit/`:
 See `benchmark/research/japanese_stress_cases.md` for source-aligned evidence and
 configuration caveats. `fairness_audit/audit.json`, `paddle_profiles.py`, resolved
 YAMLs, logs, hashes and `inspect_audit.py` preserve the actual runs.
-The audit worker currently reads only `chars_rem/page_0001.pdf`.
+The audit worker currently reads only `input/<document>/page_0001_chars_rem.pdf`.
 
-The first two documents now have all 24 new augmented variants, plus their old
-`scan` variant. The medical/NTA documents still have their legacy inputs; run
-`--prepare` to append the full grid. Existing 38 checked input/output hashes were
-unchanged. Preview: `augmentation_preview/jasyn_746_02_spans-hard.jpg`.
+Earlier corpora were prepared with the old severity grid. `--prepare` now rejects a
+saved augmentation version other than 4, so prepare those documents into a fresh IO
+directory rather than appending to them. Existing 38 checked input/output hashes
+were unchanged at the time. Preview: `augmentation_preview/jasyn_746_02_spans-hard.jpg`.
 
 ## Latest one-page GPU check
 
@@ -127,17 +147,22 @@ been rerun on the new augmentation grid. No LLM judging was run tonight.
 
 ## Premade setup
 
-`benchmark/datagen/premade/japanese_stress_setup.py` recreates all four selected
-raw PDFs and selected annotations from pinned/hash-checked public downloads.
-Default IO is the existing corpus, so rerunning preserves its results. Override
-`--io-dir` for a separate experiment. `japanese_stress_sources.json` carries the
-current source catalog; `premade/README.md` describes usage. This is the selected
-four-page corpus, not a downloader for the full official benchmark suites.
+Both setup scripts feed the single shared corpus `benchmark/datagen/io/raw/`; there
+are no per-dataset IO folders.
+`benchmark/datagen/premade/japanese_stress_setup.py` recreates all four selected raw
+PDFs and the selected annotations from pinned/hash-checked public downloads, caching
+its sources under `premade/cache/japanese-stress/` and copying the finished PDFs into
+the shared corpus (`--no-publish` skips the copy, `--io-dir` relocates the build).
+`benchmark/datagen/premade/japanese_public_setup.py` restores the 20 archived
+public-sector Japanese PDFs from pinned Wayback snapshots with SHA-256 checks, using
+`japanese_public_sources.json`. `japanese_stress_sources.json` carries the stress
+source catalog; `premade/README.md` describes usage. These are selected corpora, not
+downloaders for the full official benchmark suites.
 
 ```bash
 benchmark/.venv/bin/python benchmark/datagen/premade/japanese_stress_setup.py
-benchmark/.venv/bin/python benchmark/main.py --prepare \
-  --io-dir benchmark/datagen/io/japanese-stress-20261012
+benchmark/.venv/bin/python benchmark/datagen/premade/japanese_public_setup.py
+benchmark/.venv/bin/python benchmark/main.py --prepare
 benchmark/.venv/bin/python -m unittest benchmark.test_benchmark -v
 ```
 

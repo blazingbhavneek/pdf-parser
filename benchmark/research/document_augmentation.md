@@ -15,7 +15,7 @@ accuracy. That requires training ablations and a held-out Japanese test set.
 
 The useful objective is **more realistic, recoverable failures**, not simply more
 wrong characters. An unreadable page can produce many errors while supplying poor
-supervision for exact transcription. Keep hard stress cases, but separate them
+supervision for exact transcription. Keep the strongest samples, but separate them
 from examples approved for training.
 
 ## Implemented capture grid
@@ -25,25 +25,38 @@ The original page is immutable. A clean lossless raster copy forces OCR. Each
 augmentation starts independently from the clean original raster, rather than
 repeatedly degrading another augmentation.
 
-Eight profiles are crossed with three severities. Isolated `resolution`,
-`compression`, `motion`, `ink`, and `warp` variants help attribute failures.
-`scan`, `photo`, and `screen` combine defects that co-occur during capture.
+One stacked output per page: every effect is applied to the same image, matching how a
+real capture degrades everything at once. The trade-off is attribution — a failure on a
+stacked page cannot be pinned to one defect, so use the recorded per-knob parameters
+when a specific condition has to be isolated again.
 
-| Condition | Mild / medium / hard settings before random sampling |
+There are no profiles and no severity levels. Every knob has one range from the mildest
+useful value to the strongest still-recoverable value, and each page draws one value per
+knob independently and uniformly (`BIAS = 1`), so no strength is favored within the used
+range.
+
+Only `SPAN = 0.5` of each range is sampled, so the strong end below is the nominal
+ceiling rather than a reachable level; halve these numbers to get the real maximum, which
+also caps how badly one page can stack up.
+
+| Condition | Nominal range mild → strong, sampled over the mild half |
 | --- | --- |
-| Resolution in scan/photo/screen/resolution | Scale 0.72–0.88 / 0.45–0.62 / 0.25–0.38, then restore raster dimensions |
-| JPEG in scan/photo/screen/compression | Quality 78–90 / 48–65 / 22–38, with chroma subsampling |
-| Scan skew | Absolute angle 0.2–0.7° / 1–2° / 2.5–4°, fitted inside the page |
-| Motion blur | Length 1.5–2.5 / 4–6 / 8–12 pixels at the reference raster size; sampled direction |
-| Photo/screen perspective | Inset envelope 1–2.5% / 3–6% / 7–11%; each corner samples 50–100% of that envelope |
-| Photo shadow | Maximum attenuation 8–16% / 22–35% / 40–55%, sampled direction |
-| Ink | Partial thinning/spreading blend 0.15–0.30 / 0.40–0.55 / 0.65–0.80, plus fading |
-| Curvature | Baseline amplitude 0.5–1.2% / 1.8–3% / 4–6.5% of page height, fitted inside the canvas |
-| Screen interference | Sinusoidal intensity amplitude 2–5 / 7–12 / 16–24 on an 8-bit scale |
+| Resolution | Scale 0.80–0.22 — disabled in version 6, too destructive inside the stack |
+| JPEG | Quality 86–20, chroma subsampling 0, 1 or 2 |
+| Scan skew | Absolute angle 0.5–15°, fitted inside the page |
+| Defocus blur | Radius 0.4–2.8 at the reference raster size |
+| Motion blur | Length 2.5–14 pixels at the reference raster size; sampled direction |
+| Perspective | Inset envelope 1.5–15%; each corner samples 50–100% of that envelope |
+| Shadow | Maximum attenuation 14–62%, sampled direction |
+| Ink | Partial thinning/spreading blend 0.25–0.88, toner retention 0.60–0.95 |
+| Curvature | Baseline amplitude 0.8–7.5% of page height, 1–2 sine cycles, fitted inside the canvas |
+| Screen interference | Sinusoidal intensity amplitude 4–28 on an 8-bit scale |
+| Contrast | Factor 0.96–0.60 |
+| Sensor noise | Gaussian standard deviation 1.0–7.0 on an 8-bit scale |
 
 Blur lengths are scaled by raster short-edge length / 2480. This is a practical
 A4-at-300-DPI reference, not physical camera calibration. Noise and compression
-parameters are in the sidecar JSON. Screen interference and curvature are simple
+parameters are in the prepare manifest, `cache/input/<document>.json`. Screen interference and curvature are simple
 simulations; validate against actual company scans/photos before tuning their
 sampling frequency. No new augmentation dependency is needed.
 
@@ -68,8 +81,9 @@ automatic image-quality classifier.
    label unreadable text. For box/region supervision, transform annotations using
    the saved homography or mesh; untransformed original coordinates are wrong.
    This benchmark records transforms but does not export training annotations.
-4. **Keep clean and mild examples prominent.** Start with a mixture of clean,
-   mild and medium inputs and a smaller reviewed hard subset. Select the final
+4. **Keep clean and mild examples prominent.** Start with clean inputs plus the
+   mildest half of each range, and add a smaller reviewed subset of the strongest
+   samples. Select the final
    mixture through ablations, not a claimed universal ratio. Keep a clean
    validation set and a separate fixed stress set; also evaluate real scans/photos.
 5. **Mine diverse failures.** Prefer the weakest degradation that exposes a
@@ -81,8 +95,8 @@ automatic image-quality classifier.
    rotated labels, financial forms and irregular merged cells. Preserve source
    codepoints; do not normalize away width/compatibility distinctions or blacklist
    shared Han characters as Chinese. Review actual substituted characters.
-7. **Measure the fine-tuning result.** Compare clean-only, clean plus mild/medium,
-   and clean plus reviewed hard examples, keeping source pages, training budget
+7. **Measure the fine-tuning result.** Compare clean-only, clean plus low-half
+   samples, and clean plus reviewed high-end samples, keeping source pages, training budget
    and held-out tests comparable. Report verified character errors, reading order,
    table content and table structure separately. LLM estimates alone cannot
    establish a fine-tuning gain.
@@ -95,24 +109,23 @@ missing detail: record its provenance and inspect the original pixels.
 ## Running and resuming
 
 ```bash
-# Full stress grid: 24 augmented inputs plus 2 baselines per source page.
+# Every raw document: 1 stacked augmented page plus 2 baselines per source page.
 benchmark/.venv/bin/python benchmark/main.py --prepare
 
-# Smaller starting set; later commands append missing pairs without deleting any.
-benchmark/.venv/bin/python benchmark/main.py --prepare \
-  --augmentations scan photo ink warp --severities mild medium
+# Selected documents only.
+benchmark/.venv/bin/python benchmark/main.py --prepare --documents "report"
 
 # Parse with the selected Japanese-capable configurations in benchmark/.env.
 benchmark/.venv/bin/python benchmark/main.py --parse \
   --pipelines mineru paddle --variants chars_rem augmented --attempts 1
 ```
 
-The fixed seed makes the benchmark repeatable. Severity siblings share the same
-profile seed; the actual downstream error rate can still be nonmonotonic. Changing
+The fixed seed makes the benchmark repeatable: a page redraws the same strengths every
+run; the actual downstream error rate can still be nonmonotonic. Changing
 the seed or raster DPI requires a fresh IO directory or renamed raw source, so
 existing parser results remain attributable to their exact input.
 
 Keep the settings and package versions with any exported dataset. Increasing the
-grid size increases disk use and parser work; 24 siblings do not count as 24
+grid size increases disk use and parser work; siblings of one page do not count as
 independent documents. Compare matched coverage, retain per-condition results,
 and use the original page as the common scoring reference.

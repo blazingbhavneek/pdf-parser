@@ -17,3 +17,5 @@ benchmark/datagen/io/**
 !benchmark/datagen/io/input/
 !benchmark/datagen/io/output/
 !benchmark/datagen/io/**/.gitkeep
+benchmark/datagen/premade/cache/
+.venvs/

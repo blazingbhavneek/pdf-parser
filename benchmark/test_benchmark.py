@@ -8,8 +8,11 @@ import json
 import os
 from pathlib import Path
 import shlex
+import statistics
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -18,8 +21,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from benchmark import main as bench
-from benchmark.datagen.augment import LEGACY_PROFILES, PROFILES, SEVERITIES, augment, page_seed
-from benchmark.datagen.render import MarkdownRenderer, image_pdf, pdf_image
+from benchmark.datagen.augment import SPAN, VERSION, augment
+from benchmark.datagen.render import MarkdownRenderer, pdf_image
+from benchmark.datagen.premade import japanese_public_setup as public
 from benchmark.datagen.premade import japanese_stress_setup as premade
 
 
@@ -34,7 +38,7 @@ class BenchmarkTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        for name in ("raw", "input", "output"):
+        for name in ("raw", "input", "output", "score", "cache"):
             (self.root / name).mkdir()
         self.source = self.root / "raw" / "日本語.pdf"
         with pymupdf.open() as document:
@@ -42,63 +46,63 @@ class BenchmarkTest(unittest.TestCase):
                 page = document.new_page(width=300, height=400)
                 page.insert_text((20, 50), text, fontname="japan", fontsize=12)
             document.save(self.source)
-        self.args = argparse.Namespace(dpi=100, seed=42, augmentations=list(LEGACY_PROFILES),
-                                       severities=["medium"],
-                                       judge_dpi=100, documents=None, pipelines=None,
+        self.args = argparse.Namespace(dpi=100, seed=42, workers=1, judge_dpi=100,
+                                       documents=None, pipelines=None,
                                        variants=list(bench.VARIANTS), redo=None, limit=None,
                                        export=None, top=200)
         self.config = {"LLM_BASE_URL": "http://unused/v1", "LLM_MODEL": "test"}
         self.document = self.root / "input" / "日本語"
 
     def prepare(self):
-        return bench.prepare_document(self.source, self.document, self.args, {})
+        return bench.prepare_document(self.root, self.source, self.document.name, self.args, {})
 
-    def candidate(self, variant="original", profile=None):
-        folder = self.root / "output" / "日本語" / "mineru" / variant
-        stem = "page_0001" + ("_" + profile if profile else "")
-        path = folder / f"{stem}_attempt1.md"
+    def augmented(self):
+        """Page PDFs in input/ that are neither the clean original nor the text-free raster."""
+        return sorted(p for p in self.document.glob("page_*.pdf")
+                      if bench.page_type(p.stem) not in ("original", "chars_rem"))
+
+    def candidate(self, kind="original"):
+        path = self.root / "output" / "mineru" / "日本語" / f"page_0001_{kind}_attempt1.md"
         bench.atomic_write(path, "# 日本語\n\n駅 カタカナ ひらがな\n")
         return path
 
     def test_prepare_preserves_original_and_removes_all_detectable_text(self):
-        self.args.augmentations = list(PROFILES)
-        self.args.severities = list(SEVERITIES)
         self.assertTrue(self.prepare())
-        self.assertEqual(len(list(self.document.glob("original/*.pdf"))), 2)
-        self.assertEqual(len(list(self.document.glob("chars_rem/*.pdf"))), 2)
-        self.assertEqual(len(list(self.document.glob("augmented/*.pdf"))), 48)
-        for original in self.document.glob("original/*.pdf"):
+        originals = sorted(self.document.glob("page_*_original.pdf"))
+        rasters = sorted(self.document.glob("page_*_chars_rem.pdf"))
+        self.assertEqual([p.name for p in originals], ["page_0001_original.pdf", "page_0002_original.pdf"])
+        self.assertEqual([p.name for p in rasters], ["page_0001_chars_rem.pdf", "page_0002_chars_rem.pdf"])
+        self.assertEqual(len(self.augmented()), 2)
+        self.assertTrue(all(p.suffix == ".pdf" for p in self.document.iterdir()))
+        for original, raster in zip(originals, rasters):
             with pymupdf.open(original) as document:
                 self.assertEqual(len(document), 1)
                 self.assertTrue(document[0].get_text().strip())
-            raster = self.document / "chars_rem" / original.name
             self.assertEqual(pdf_image(original, 100).tobytes(), pdf_image(raster, 100).tobytes())
-        for path in [*self.document.glob("chars_rem/*.pdf"), *self.document.glob("augmented/*.pdf")]:
+        for path in rasters + self.augmented():
             with pymupdf.open(path) as document:
                 self.assertEqual(len(document), 1)
                 self.assertEqual(document[0].get_text(), "")
                 self.assertFalse(document[0].get_fonts())
                 self.assertEqual(document[0].rect, pymupdf.Rect(0, 0, 300, 400))
-        hint = bench.read_json(self.document / "original" / "page_0001.hint.json")
+        hint = bench.read_json(self.root / "cache" / "hint" / "日本語" / "page_0001.json")
         self.assertFalse(hint["verified"])
         self.assertIn("駅", hint["native_text"])
 
     def test_resume_repairs_missing_files_and_rejects_changed_sources(self):
         self.prepare()
-        original = self.document / "original" / "page_0001.pdf"
+        original = self.document / "page_0001_original.pdf"
         timestamp = original.stat().st_mtime_ns
         self.assertFalse(self.prepare())
-        missing = self.document / "augmented" / "page_0001_photo_medium.pdf"
+        missing = self.document / "page_0001_aug.pdf"
         expected = pdf_image(missing, 100).tobytes()
         missing.unlink()
         self.assertTrue(self.prepare())
         self.assertEqual(original.stat().st_mtime_ns, timestamp)
         self.assertEqual(pdf_image(missing, 100).tobytes(), expected)
-        pdf_hash = bench.digest(missing)
-        missing.with_suffix(".json").unlink()
-        self.assertTrue(self.prepare())
-        self.assertEqual(bench.digest(missing), pdf_hash)
-        self.assertTrue(missing.with_suffix(".json").is_file())
+        self.assertFalse(self.prepare())
+        recorded = bench.read_json(self.root / "cache" / "input" / "日本語.json")["pages"][0]["augmentations"]
+        self.assertEqual(recorded["version"], VERSION)
         self.args.dpi = 150
         with self.assertRaisesRegex(ValueError, "settings changed"):
             self.prepare()
@@ -110,7 +114,7 @@ class BenchmarkTest(unittest.TestCase):
 
     def test_partial_manifest_resumes_and_unowned_folder_is_rejected(self):
         self.prepare()
-        path = self.document / "manifest.json"
+        path = self.root / "cache" / "input" / "日本語.json"
         manifest = bench.read_json(path)
         manifest["complete"] = False
         bench.write_json(path, manifest)
@@ -122,103 +126,113 @@ class BenchmarkTest(unittest.TestCase):
     def test_augmentation_is_seeded_and_keeps_size(self):
         image = Image.new("RGB", (300, 400), "white")
         ImageDraw.Draw(image).text((40, 40), "sample text", fill="black")
-        for profile in PROFILES:
-            for severity in SEVERITIES:
-                with self.subTest(profile=profile, severity=severity):
-                    first, settings = augment(image, profile, 42, severity)
-                    second, settings2 = augment(image, profile, 42, severity)
-                    self.assertEqual(first.size, image.size)
-                    self.assertEqual(first.tobytes(), second.tobytes())
-                    self.assertEqual(settings, settings2)
-                    self.assertNotEqual(first.tobytes(), image.tobytes())
-                    self.assertTrue(settings["training_review_required"])
-                    # Metadata must survive JSON round-tripping, including warp meshes.
-                    self.assertEqual(json.dumps(settings), json.dumps(json.loads(json.dumps(settings))))
-        for profile, severity in (("unknown", "hard"), ("scan", "unknown"), ("warp", None)):
-            with self.assertRaises(ValueError):
-                augment(image, profile, 42, severity)
+        first, settings = augment(image, 42)
+        second, settings2 = augment(image, 42)
+        self.assertEqual(first.size, image.size)
+        self.assertEqual(first.tobytes(), second.tobytes())
+        self.assertEqual(settings, settings2)
+        self.assertNotEqual(first.tobytes(), image.tobytes())
+        self.assertTrue(settings["training_review_required"])
+        # Every effect lands on the same page, each with its own recorded strength.
+        self.assertEqual(set(settings["geometry"]), {"perspective", "skew", "curvature"})
+        self.assertNotIn("resolution_scale", settings)  # Stage is disabled in this version.
+        for key in ("rotation_degrees", "gaussian_blur_radius",
+                    "motion_blur_pixels", "ink_strength", "ink_retention", "contrast",
+                    "shadow_strength", "moire_strength", "noise_std", "jpeg_quality"):
+            self.assertIn(key, settings)
+        # Metadata must survive JSON round-tripping, including the curvature mesh.
+        self.assertEqual(json.dumps(settings), json.dumps(json.loads(json.dumps(settings))))
 
-    def test_severity_increases_effect_strength_without_cropping_geometry(self):
+    def test_stacked_knobs_stay_uniform_in_range_and_never_crop_the_page(self):
         image = Image.new("RGB", (300, 400), "white")
-        measures = {"scan": ("rotation_degrees", abs), "motion": ("motion_blur_pixels", float),
-                    "resolution": ("resolution_scale", lambda x: -x),
-                    "compression": ("jpeg_quality", lambda x: -x),
-                    "ink": ("ink_strength", float), "screen": ("moire_strength", float),
-                    "photo": ("shadow_strength", float)}
+        pixel_scale = 300 / 2480  # Knob bounds are expressed for an A4 page at 300 DPI.
+        knobs = {  # knob: (value, mildest, strongest); mild first so t=0 is always the gentle end
+            "skew_degrees": (lambda s: abs(s["rotation_degrees"]), 0.5, 15.0),
+            "motion_pixels": (lambda s: s["motion_blur_pixels"] / pixel_scale, 2.5, 14.0),
+            "jpeg_quality": (lambda s: float(s["jpeg_quality"]), 86.0, 20.0),
+            "ink_strength": (lambda s: s["ink_strength"], 0.25, 0.88),
+            "moire_strength": (lambda s: s["moire_strength"], 4.0, 28.0),
+            "shadow_strength": (lambda s: s["shadow_strength"], 0.14, 0.62),
+            "noise_std": (lambda s: s["noise_std"], 1.0, 7.0),
+            "curvature_percent": (lambda s: abs(s["geometry"]["curvature"]["amplitude_pixels"]) / 4,
+                                  0.8, 7.5),
+        }
         corners = np.array([[0, 0, 1], [300, 0, 1], [300, 400, 1], [0, 400, 1]])
-        for profile in PROFILES:
-            strengths = []
-            for severity in SEVERITIES:
-                _, settings = augment(image, profile, 42, severity)
-                geometry = settings["geometry"]
+        positions = {name: [] for name in knobs}
+        for seed in range(80):
+            _, settings = augment(image, seed)
+            for geometry in settings["geometry"].values():
                 if geometry["kind"] == "homography":
                     output = corners @ np.array(geometry["source_to_output"]).T
                     output = output[:, :2] / output[:, 2, None]
                     self.assertTrue(np.all(output >= 0))
                     self.assertTrue(np.all(output <= [300, 400]))
-                elif geometry["kind"] == "sine_mesh":
+                else:
                     x = np.linspace(0, 300, 100)
                     mx, my = geometry["margin"]
                     sx, sy = geometry["scale"]
                     for y in (0, 400):
-                        v = my + sy * y + geometry["amplitude_pixels"] * np.sin(np.pi * x / 300)
+                        v = (my + sy * y
+                             + geometry["amplitude_pixels"]
+                             * np.sin(np.pi * geometry["sine_cycles"] * x / 300))
                         self.assertTrue(np.all((v >= 0) & (v <= 400)))
                     self.assertTrue(np.all((mx + sx * x >= 0) & (mx + sx * x <= 300)))
-                    strengths.append(abs(geometry["amplitude_pixels"]))
-                if profile in measures:
-                    key, measure = measures[profile]
-                    strengths.append(measure(settings[key]))
-            self.assertEqual(strengths, sorted(set(strengths)))
+            page = []
+            for name, (value, mild, strong) in knobs.items():
+                t = (value(settings) - mild) / (strong - mild) / SPAN  # Of the used range.
+                self.assertTrue(0 <= t <= 1, f"{name} out of range: {t}")
+                positions[name].append(t)
+                page.append(t)
+            # SPAN caps the worst case, and a page must never draw every knob at the ceiling.
+            self.assertLess(min(page), 0.95, f"seed {seed}")
+        for name, t in positions.items():
+            self.assertGreater(max(t), 0.8, f"{name} never reaches its strong end")
+            # Unbiased: both the mean and the median sit in the middle of the used range.
+            self.assertTrue(0.4 < statistics.fmean(t) < 0.6, f"{name} is not uniform: {statistics.fmean(t)}")
+            self.assertTrue(0.35 < statistics.median(t) < 0.65, f"{name} is not uniform")
 
-    def test_prepare_appends_exact_pairs_and_migrates_legacy_without_replacing_inputs(self):
-        self.args.augmentations = ["scan"]
-        self.prepare()
-        manifest_path = self.document / "manifest.json"
-        manifest = bench.read_json(manifest_path)
-        for path in (self.document / "augmented").iterdir():
-            path.unlink()
-        manifest["files"] = [name for name in manifest["files"] if not name.startswith("augmented/")]
-        manifest["settings"] = {"dpi": 100, "seed": 42, "profiles": ["scan"], "augmentation_version": 1}
-        for page in manifest["pages"]:
-            stem = f"page_{page['page']:04d}"
-            image = pdf_image(self.document / "original" / f"{stem}.pdf", 100)
-            seed = page_seed(manifest["source_sha256"], page["page"], "scan", 42)
-            legacy, parameters = augment(image, "scan", seed)
-            target = self.document / "augmented" / f"{stem}_scan.pdf"
-            bench.atomic_write(target, image_pdf(legacy, page["width"], page["height"]))
-            bench.write_json(target.with_suffix(".json"), parameters)
-            page["augmentations"] = {"scan": parameters}
-            manifest["files"].extend(str(p.relative_to(self.document)) for p in (target, target.with_suffix(".json")))
-        bench.write_json(manifest_path, manifest)
-        candidate = self.candidate("augmented", "scan")
-        hashes = {name: bench.digest(self.document / name) for name in manifest["files"]}
-        markdown_hash = bench.digest(candidate)
-        self.args.augmentations, self.args.severities = ["photo"], ["hard"]
+    def test_prepare_writes_one_stacked_page_and_rejects_other_versions(self):
         self.assertTrue(self.prepare())
-        self.assertEqual({p.stem for p in (self.document / "augmented").glob("*.pdf")},
-                         {f"page_{i:04d}_{v}" for i in (1, 2) for v in ("scan", "photo_hard")})
+        self.assertEqual([p.name for p in self.augmented()],
+                         ["page_0001_aug.pdf", "page_0002_aug.pdf"])
+        manifest_path = self.root / "cache" / "input" / "日本語.json"
+        manifest = bench.read_json(manifest_path)
+        self.assertEqual(manifest["settings"], {"dpi": 100, "seed": 42,
+                                                "augmentation_version": VERSION})
+        hashes = {name: bench.digest(self.document / name) for name in manifest["files"]}
+        self.assertFalse(self.prepare())
         for name, expected in hashes.items():
             self.assertEqual(bench.digest(self.document / name), expected)
-        self.assertEqual(bench.digest(candidate), markdown_hash)
-        self.assertFalse(self.prepare())
-        missing = self.document / "augmented" / "page_0001_scan.pdf"
-        expected_pixels = pdf_image(missing, 100).tobytes()
-        missing.unlink()
-        self.assertTrue(self.prepare())
-        self.assertEqual(pdf_image(missing, 100).tobytes(), expected_pixels)
-        self.args.augmentations, self.args.severities = ["ink"], ["mild"]
-        self.assertTrue(self.prepare())
-        self.assertEqual(set(bench.read_json(manifest_path)["settings"]["variants"]),
-                         {"scan", "photo_hard", "ink_mild"})
+        manifest["settings"]["augmentation_version"] = VERSION - 1
+        bench.write_json(manifest_path, manifest)
+        with self.assertRaisesRegex(ValueError, "augmentation version"):
+            self.prepare()
 
-    def test_severity_output_resolves_to_clean_reference(self):
+    def test_stacked_output_resolves_to_clean_reference(self):
         self.prepare()
-        candidate = self.candidate("augmented", "scan_medium")
+        candidate = self.candidate("aug")
         sources = bench.score_sources(self.root, candidate)
-        self.assertEqual(sources["profile"], "scan_medium")
-        self.assertEqual(sources["reference"], self.document / "original" / "page_0001.pdf")
-        self.assertEqual(sources["input"], self.document / "augmented" / "page_0001_scan_medium.pdf")
+        self.assertEqual(sources["profile"], "aug")
+        self.assertEqual(sources["reference"], self.document / "page_0001_original.pdf")
+        self.assertEqual(sources["input"], self.document / "page_0001_aug.pdf")
         self.assertTrue(sources["input"].is_file())
+
+    def test_parallel_prepare_matches_serial_page_for_page(self):
+        self.assertTrue(self.prepare())
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        parallel = Path(other.name)
+        for name in ("raw", "input", "output", "score", "cache"):
+            (parallel / name).mkdir()
+        (parallel / "raw" / self.source.name).write_bytes(self.source.read_bytes())
+        self.args.workers = 2
+        source = parallel / "raw" / self.source.name
+        self.assertTrue(bench.prepare_document(parallel, source, self.document.name, self.args, {}))
+        self.assertEqual(bench.read_json(parallel / "cache" / "input" / f"{self.document.name}.json")["pages"],
+                         bench.read_json(self.root / "cache" / "input" / f"{self.document.name}.json")["pages"])
+        for path in sorted(self.document.glob("page_*.pdf")):
+            twin = parallel / "input" / self.document.name / path.name
+            self.assertEqual(pdf_image(twin, 100).tobytes(), pdf_image(path, 100).tobytes(), path.name)
 
     def test_premade_setup_downloads_validates_normalizes_and_preserves_existing_files(self):
         import hashlib
@@ -266,6 +280,27 @@ class BenchmarkTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "collide"):
             bench.source_documents(self.root)
 
+    def test_public_setup_fetches_pinned_hashes_and_keeps_existing_files(self):
+        import hashlib
+        catalog = self.root / "catalog"
+        catalog.mkdir()
+        pdf = self.source.read_bytes()
+        documents = {"public_a.pdf": {"snapshot": "https://example.test/a.pdf",
+                                      "sha256": hashlib.sha256(pdf).hexdigest()},
+                     "public_bad.pdf": {"snapshot": "https://example.test/bad.pdf", "sha256": "0" * 64}}
+        catalog_file = catalog / "japanese_public_sources.json"
+        bench.write_json(catalog_file, {"documents": documents})
+        with patch.object(public, "HERE", catalog), patch.object(
+                public, "urlopen", side_effect=lambda request, **kwargs: io.BytesIO(pdf)) as network:
+            with self.assertRaisesRegex(ValueError, "pinned hash"):
+                public.setup(self.root)
+            self.assertEqual((self.root / "raw" / "public_a.pdf").read_bytes(), pdf)
+            self.assertFalse((self.root / "raw" / "public_bad.pdf").exists())
+            self.assertEqual(network.call_count, 2)
+            bench.write_json(catalog_file, {"documents": {"public_a.pdf": documents["public_a.pdf"]}})
+            public.setup(self.root)
+            self.assertEqual(network.call_count, 2)
+
     def test_existing_document_identity_survives_new_same_stem_format(self):
         self.prepare()
         (self.root / "raw" / "日本語.docx").touch()
@@ -293,6 +328,21 @@ class BenchmarkTest(unittest.TestCase):
             self.assertEqual(bench.convert_office(source, target, config), "libreoffice")
         bench.valid_pdf(target.read_bytes())
 
+    def test_prepare_converts_office_into_cache_and_keeps_input_pdfs_only(self):
+        source = self.root / "raw" / "報告書.docx"
+        source.write_bytes(b"fake-office-file")
+        config = {"CONVERTER_URL": "http://converter/convert"}
+        with patch.object(bench, "request_bytes", return_value=self.source.read_bytes()) as request:
+            self.assertTrue(bench.prepare_document(self.root, source, "報告書", self.args, config))
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(sorted(p.name for p in (self.root / "input" / "報告書").iterdir()),
+                         [f"page_{page:04d}_{kind}.pdf" for page in (1, 2)
+                          for kind in ("aug", "chars_rem", "original")])
+        manifest = bench.read_json(self.root / "cache" / "input" / "報告書.json")
+        self.assertEqual(manifest["converter"], "endpoint")
+        self.assertTrue((self.root / "cache" / "convert" / "報告書.pdf").is_file())
+        self.assertFalse(bench.prepare_document(self.root, source, "報告書", self.args, config))
+
     def test_pipeline_isolated_attempts_resume_and_retain_assets(self):
         self.prepare()
         worker = self.root / "fake worker.py"
@@ -303,15 +353,19 @@ class BenchmarkTest(unittest.TestCase):
         config = {"MINERU_VENV": str(Path(sys.executable).parent.parent),
                   "MINERU_COMMAND": "{python} " + shlex.quote(str(worker)) + " {input} {output}"}
         setup = bench.pipeline_setup("mineru", config, self.root)
-        source = self.document / "original" / "page_0001.pdf"
-        output = self.root / "output" / "日本語" / "mineru" / "original"
-        self.assertTrue(bench.parse_page(source, output, setup, 1, config))
-        self.assertFalse(bench.parse_page(source, output, setup, 1, config))
-        self.assertTrue(bench.parse_page(source, output, setup, 2, config))
-        marker = bench.read_json(output / "page_0001_attempt1.run.json")
+        source = self.document / "page_0001_original.pdf"
+        output = self.root / "output" / "mineru" / "日本語"
+        scratch = self.root / "cache" / "parse" / "mineru" / "日本語"
+        self.assertTrue(bench.parse_page(source, self.root, "mineru", "日本語", setup, 1, config))
+        self.assertFalse(bench.parse_page(source, self.root, "mineru", "日本語", setup, 1, config))
+        self.assertTrue(bench.parse_page(source, self.root, "mineru", "日本語", setup, 2, config))
+        self.assertEqual([p.name for p in output.iterdir()],
+                         ["page_0001_original_attempt1.md", "page_0001_original_attempt2.md"])
+        marker = bench.read_json(scratch / "page_0001_original_attempt1.run.json")
         self.assertIn("versions", marker)
-        self.assertTrue((output / marker["artifact_markdown"]).is_file())
-        self.assertEqual((output / "page_0001_attempt1.md").read_text(), "# 駅\n")
+        self.assertTrue((scratch / marker["artifact_markdown"]).is_file())
+        self.assertTrue((scratch / marker["artifact_root"] / "run.log").is_file())
+        self.assertEqual((output / "page_0001_original_attempt1.md").read_text(), "# 駅\n")
         env = bench.isolated_environment(setup[0])
         self.assertNotIn("PYTHONPATH", env)
         self.assertEqual(env["VIRTUAL_ENV"], str(setup[0]))
@@ -320,12 +374,14 @@ class BenchmarkTest(unittest.TestCase):
         self.prepare()
         venv = Path(sys.executable).parent.parent
         setup = (venv, ["{python}", "-c", "raise SystemExit(1)"], {})
-        source = self.document / "original" / "page_0001.pdf"
-        output = self.root / "output" / "日本語" / "mineru" / "original"
+        source = self.document / "page_0001_original.pdf"
+        output = self.root / "output" / "mineru" / "日本語"
+        scratch = self.root / "cache" / "parse" / "mineru" / "日本語"
         with self.assertRaises(RuntimeError):
-            bench.parse_page(source, output, setup, 1, {})
-        self.assertFalse((output / "page_0001_attempt1.md").exists())
-        self.assertEqual(len(list((output / ".artifacts").glob("*/run.log"))), 1)
+            bench.parse_page(source, self.root, "mineru", "日本語", setup, 1, {})
+        self.assertFalse((output / "page_0001_original_attempt1.md").exists())
+        self.assertEqual(len(list(scratch.glob("**/run.log"))), 1)
+        self.assertFalse((scratch / "page_0001_original_attempt1.run.json").exists())
 
     def test_mineru_four_uses_direct_inference_without_a_server(self):
         venv = Path(sys.executable).parent.parent
@@ -351,9 +407,55 @@ class BenchmarkTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "subset"):
             bench.validate_judgment(result)
 
+    def test_chat_does_not_set_a_completion_token_limit(self):
+        response = {"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]}
+        config = {"LLM_BASE_URL": "http://unused/v1", "LLM_MODEL": "test",
+                  "LLM_MAX_TOKENS": "1"}
+        with patch.object(bench, "request_bytes", return_value=json.dumps(response).encode()) as request:
+            bench.chat(config, [])
+        payload = json.loads(request.call_args.args[1])
+        self.assertNotIn("max_tokens", payload)
+        self.assertNotIn("max_tokens", bench.judge_settings(config, 180))
+
+    def test_score_uses_four_concurrent_judgments(self):
+        self.prepare()
+        self.args.pipelines = list(bench.PIPELINES)
+        self.args.variants = ["original"]
+        for pipeline in bench.PIPELINES:
+            path = self.root / "output" / pipeline / "日本語" / "page_0001_original_attempt1.md"
+            bench.atomic_write(path, "# 日本語\n\n駅 カタカナ ひらがな\n")
+        active, maximum = 0, 0
+        lock = threading.Lock()
+
+        def fake_chat(config, content):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            result = judgment()
+            return result, {"choices": [{"message": {"content": json.dumps(result)}}]}
+
+        class FakeRenderer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def render(self, content, asset_base, asset_root, width, height, dpi, destination):
+                Image.new("RGB", (100, 100), "white").save(destination.with_suffix(".png"))
+                return {"fit_scale": 1.0}
+
+        with patch.object(bench, "chat", fake_chat), patch.object(bench, "MarkdownRenderer", FakeRenderer):
+            self.assertEqual(bench.score_all(self.root, self.args, self.config), 0)
+        self.assertEqual(maximum, bench.SCORE_CONCURRENCY)
+
     def test_score_always_uses_original_resume_redo_and_content_invalidation(self):
         self.prepare()
-        markdown = self.candidate("augmented", "photo_medium")
+        markdown = self.candidate("aug")
         sent = []
 
         def fake_chat(config, content):
@@ -377,7 +479,7 @@ class BenchmarkTest(unittest.TestCase):
             reference = next(item for item in sent[0] if item["type"] == "image_url")
             image_data = base64.b64decode(reference["image_url"]["url"].split(",", 1)[1])
             with Image.open(io.BytesIO(image_data)) as received:
-                expected = pdf_image(self.document / "original" / "page_0001.pdf", 100)
+                expected = pdf_image(self.document / "page_0001_original.pdf", 100)
                 self.assertEqual(received.tobytes(), expected.tobytes())
             self.assertEqual(bench.score_all(self.root, self.args, self.config), 0)
             self.assertEqual(len(sent), 1)
@@ -407,14 +509,14 @@ class BenchmarkTest(unittest.TestCase):
             records[key] = {**{key: sources[key] for key in ("document", "page", "pipeline", "variant", "profile")},
                             "status": "complete", "score": count,
                             "fingerprint": bench.fingerprint(markdown, sources, settings)}
-        bench.write_json(self.root / "scores.json", {"records": records})
+        bench.write_json(self.root / "score" / "scores.json", {"records": records})
         bench.rank_pages(self.root, self.args, self.config)
-        pages = bench.read_json(self.root / "difficult_pages.json")["pages"]
+        pages = bench.read_json(self.root / "score" / "ranking.json")["pages"]
         self.assertEqual(len(pages), 1)
         self.assertEqual(pages[0]["mean_mistakes"], 15)
         bench.atomic_write(second, "changed")
         bench.rank_pages(self.root, self.args, self.config)
-        ranked = bench.read_json(self.root / "difficult_pages.json")
+        ranked = bench.read_json(self.root / "score" / "ranking.json")
         self.assertEqual(ranked["stale_scores_ignored"], 1)
         self.assertEqual(ranked["pages"][0]["mean_mistakes"], 10)
 

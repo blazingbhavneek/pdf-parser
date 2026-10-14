@@ -2,11 +2,14 @@
 
 Both MinerU and Paddle made verified mistakes on these selected pages, including
 a row-label association error in MinerU and Chinese character substitutions in
-Paddle. This is a failure-discovery set, not an overall model ranking.
+Paddle. This is a failure-discovery set, not an overall model ranking. On
+2026-10-14 the four PDFs were merged into `benchmark/datagen/io/raw/` and this
+run's input/output/evidence folders were deleted, so the numbers below are the
+historical record of that run.
 
 ## Local run
 
-The data lives in `benchmark/datagen/io/japanese-stress-20261012/`, which is ignored
+The data lived in `benchmark/datagen/io/japanese-stress-20261012/`, which is ignored
 by Git. The run contains four single-page documents, 300 DPI image-only inputs,
 and one attempt per pipeline. All eight MinerU/Paddle conversions completed.
 No extra blur/noise was applied to the tested inputs. Docling is excluded from
@@ -107,18 +110,18 @@ separate in any ranking or local-LLM judge calibration.
 
 ## Evidence and reproduction
 
-Each document has its reference in `input/<document>/original/page_0001.pdf` and
-its candidate in `output/<document>/<pipeline>/chars_rem/page_0001_attempt1.md`.
-`.run.json` files record versions, input/output hashes, commands and process times.
+Each document has its reference in `input/<document>/page_0001_original.pdf` and
+its candidate in `output/<pipeline>/<document>/page_0001_chars_rem_attempt1.md`;
+`cache/parse/<pipeline>/<document>/*.run.json` records versions, input/output hashes,
+commands and process times. Runs before 2026-10-14 used the previous folder shape.
 `ground_truth/` contains the two selected JASyn annotations.
 `evidence/nta_rows_25_27.png` is a direct crop of the original form showing the
 26/G48 and 27/G49 associations. `findings.json` records the evidence links and checks.
 
 ```bash
 benchmark/.venv/bin/python benchmark/main.py --parse \
-  --io-dir benchmark/datagen/io/japanese-stress-20261012 \
+  --io-dir benchmark/datagen/io \
   --pipelines mineru paddle --variants chars_rem --attempts 1
-benchmark/.venv/bin/python benchmark/datagen/io/japanese-stress-20261012/inspect_outputs.py
 ```
 
 The first command resumes and skips matching successful outputs. The inspector

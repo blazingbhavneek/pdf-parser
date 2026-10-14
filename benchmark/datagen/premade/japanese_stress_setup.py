@@ -17,7 +17,8 @@ from benchmark.main import atomic_write, digest, read_json, valid_pdf, write_jso
 from benchmark.datagen.render import image_pdf
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_IO = HERE.parent / "io" / "japanese-stress-20261012"
+DEFAULT_IO = HERE / "cache" / "japanese-stress"
+SHARED_RAW = HERE.parent / "io" / "raw"
 CACHE_NAMES = {"jcs2023_p031_table": "jcs2023_guideline.pdf",
                "nta2025_tax_form": "nta_corporate_tax.pdf"}
 
@@ -81,11 +82,25 @@ def setup(root):
     return root
 
 
+def publish(root, target_dir):
+    """Copy the corpus PDFs into the shared raw corpus; existing files win."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for source in sorted((root / "raw").glob("*.pdf")):
+        target = target_dir / source.name
+        if not target.exists():
+            atomic_write(target, source.read_bytes())
+            print(f"Published {target}", flush=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--io-dir", type=Path, default=DEFAULT_IO)
+    parser.add_argument("--no-publish", action="store_true",
+                        help=f"build the corpus without copying its PDFs into {SHARED_RAW}")
     args = parser.parse_args(argv)
-    setup(args.io_dir.resolve())
+    root = setup(args.io_dir.resolve())
+    if not args.no_publish:
+        publish(root, SHARED_RAW)
 
 
 if __name__ == "__main__":

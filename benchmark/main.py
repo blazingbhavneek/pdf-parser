@@ -4,6 +4,7 @@
 import argparse
 import base64
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -34,14 +35,15 @@ if not __package__:
 import pymupdf
 from dotenv import dotenv_values
 
-from benchmark.datagen.augment import (LEGACY_PROFILES, PROFILES, SEVERITIES,
-                                      VERSION as AUGMENT_VERSION, augment, page_seed)
+from benchmark.datagen.augment import AUG, VERSION as AUGMENT_VERSION, augment, page_seed
 from benchmark.datagen.render import MarkdownRenderer, VERSION as RENDER_VERSION, image_pdf, pdf_image
 
 PIPELINES = ("mineru", "docling", "paddle", "dots")
 VARIANTS = ("original", "chars_rem", "augmented")
+ORIGINAL, CHARS_REM = "original", "chars_rem"
 COUNTS = ("character_substitutions", "character_deletions", "character_insertions",
           "chinese_leakage_substitutions", "table_structure_errors", "layout_errors")
+SCORE_CONCURRENCY = 4
 PROMPT = """You are auditing extraction of an internal Japanese document page.
 The first image is the ORIGINAL reference, even when the tested PDF was degraded.
 The second image is the candidate Markdown rendered onto one page. The candidate
@@ -89,6 +91,20 @@ Return ONLY one JSON object with this exact shape (all counts are nonnegative in
 Evidence should contain real examples only, up to 20 examples; empty lists are valid.
 Confidence is between 0 and 1. Counts are your estimates, not an exact computed CER.
 """
+
+
+def page_type(stem):
+    """page_0001_scan -> scan; input has no variant folders, so the type is the name."""
+    return stem.split("_", 2)[2] if stem.count("_") > 1 else ""
+
+
+def markdown_type(stem):
+    """page_0001_scan_attempt1 -> scan."""
+    return page_type(stem.rsplit("_attempt", 1)[0])
+
+
+def variant_of(kind):
+    return kind if kind in (ORIGINAL, CHARS_REM) else "augmented"
 
 
 def now():
@@ -219,9 +235,10 @@ def source_documents(root):
     for source in sources:
         counts[source.stem.casefold()] += 1
     existing = {}
-    for path in (root / "input").glob("*/manifest.json"):
+    for path in (root / "cache" / "input").glob("*.json"):
         manifest = read_json(path)
-        existing[manifest["source_file"]] = path.parent.name
+        if manifest and manifest.get("source_file"):
+            existing[manifest["source_file"]] = path.stem
     named = [(p, existing.get(p.name, p.stem if counts[p.stem.casefold()] == 1
               else f"{p.stem}__{p.suffix[1:].lower()}")) for p in sources]
     ids = [name.casefold() for _, name in named]
@@ -230,120 +247,111 @@ def source_documents(root):
     if len(ids) != len(set(ids)):
         raise ValueError("Document folder names collide; rename the conflicting raw files")
     return named
+def prepare_page(root, converted, document, identity, args, hint_options, recorded, index):
+    """Prepare one page (original, text-free raster, stacked aug); safe to run in a worker."""
+    import pymupdf4llm
+
+    destination = root / "input" / document
+    stem = f"page_{index + 1:04d}"
+    with pymupdf.open(converted) as converted_pdf:
+        page = converted_pdf[index]
+        width, height = page.rect.width, page.rect.height  # The page object dies with the document.
+        original = destination / f"{stem}_{ORIGINAL}.pdf"
+        if not original.exists():
+            with pymupdf.open() as single:
+                single.insert_pdf(converted_pdf, from_page=index, to_page=index)
+                atomic_write(original, single.tobytes(garbage=4, deflate=True))
+        hint_path = root / "cache" / "hint" / document / f"{stem}.json"
+        if not hint_path.exists():
+            # Native per-page hints avoid inventing DOCX page boundaries with whole-document text.
+            hint = {"native_text": page.get_text(sort=True), "markdown": "",
+                    "extractor": "pymupdf4llm (OCR disabled)", "verified": False}
+            try:
+                hint["markdown"] = pymupdf4llm.to_markdown(converted_pdf, pages=[index],
+                                                          show_progress=False, **hint_options)
+            except Exception as error:
+                hint["extractor"] = "pymupdf native text (fallback)"
+                hint["extraction_error"] = str(error)
+            write_json(hint_path, hint)
+    image = pdf_image(original, args.dpi)
+    raster = root / "cache" / "raster" / document / f"{stem}.png"
+    if not raster.exists():
+        stream = io.BytesIO()
+        image.save(stream, format="PNG")
+        atomic_write(raster, stream.getvalue())
+    raster_pdf = destination / f"{stem}_{CHARS_REM}.pdf"
+    if not raster_pdf.exists():
+        atomic_write(raster_pdf, image_pdf(image, width, height))
+    # One stacked page per source page: every effect at its own sampled level.
+    augmented = destination / f"{stem}_{AUG}.pdf"
+    parameters = recorded.get(index + 1)
+    if parameters is None or not augmented.exists():
+        seed = page_seed(identity["source_sha256"], index + 1, args.seed)
+        degraded, parameters = augment(image, seed)
+        if not augmented.exists():
+            atomic_write(augmented, image_pdf(degraded, width, height))
+    names = [original.name, raster_pdf.name, augmented.name]
+    return names, {"page": index + 1, "width": width, "height": height,
+                   "augmentations": parameters}
 
 
-def prepare_document(source, destination, args, config):
+def prepare_document(root, source, document, args, config):
+    """Write one folder of page PDFs per document; all metadata goes to cache/."""
+    destination = root / "input" / document
+    manifest_path = root / "cache" / "input" / f"{document}.json"
     identity = {"source_file": source.name, "source_sha256": digest(source)}
-    manifest_path = destination / "manifest.json"
     manifest = read_json(manifest_path)
     old_settings = manifest.get("settings", {}) if manifest else {}
     if manifest and (any(manifest.get(key) != value for key, value in identity.items()) or
                      old_settings.get("dpi") != args.dpi or old_settings.get("seed") != args.seed):
         raise ValueError(f"Source or preparation settings changed for {source.name}; "
                          "use a fresh --io-dir or rename the raw document to preserve existing results")
-    variants = {}
-    if manifest:
-        if old_settings.get("augmentation_version") == 1:
-            variants = {name: {"profile": name, "severity": None, "version": 1}
-                        for name in old_settings["profiles"]}
-        elif old_settings.get("augmentation_version") == AUGMENT_VERSION:
-            variants = dict(old_settings["variants"])
-        else:
-            raise ValueError("Unsupported saved augmentation version; use a fresh --io-dir")
-    for profile in args.augmentations:
-        for severity in args.severities:
-            key = f"{profile}_{severity}"
-            specification = {"profile": profile, "severity": severity, "version": AUGMENT_VERSION}
-            if key in variants and variants[key] != specification:
-                raise ValueError(f"Conflicting saved augmentation: {key}; use a fresh --io-dir")
-            variants[key] = specification
-    for name, specification in variants.items():
-        profile, severity, saved_version = (specification[key] for key in ("profile", "severity", "version"))
-        legacy = saved_version == 1 and profile in LEGACY_PROFILES and severity is None and name == profile
-        current = (saved_version == AUGMENT_VERSION and profile in PROFILES and severity in SEVERITIES
-                   and name == f"{profile}_{severity}")
-        if not (legacy or current):
-            raise ValueError(f"Invalid saved augmentation: {name}; use a fresh --io-dir")
-    settings = {"dpi": args.dpi, "seed": args.seed, "augmentation_version": AUGMENT_VERSION,
-                "variants": variants}
+    if manifest and old_settings.get("augmentation_version") != AUGMENT_VERSION:
+        raise ValueError("Unsupported saved augmentation version; use a fresh --io-dir")
+    settings = {"dpi": args.dpi, "seed": args.seed, "augmentation_version": AUGMENT_VERSION}
     if manifest and old_settings == settings and manifest.get("complete") and all(
             (destination / name).is_file() for name in manifest["files"]):
         print(f"[prepare] Skip {source.name}", flush=True)
         return False
-    destination.mkdir(parents=True, exist_ok=True)
+    recorded = {page["page"]: page.get("augmentations") for page in (manifest or {}).get("pages", [])}
     if not manifest:
-        if any(destination.iterdir()):
-            raise ValueError(f"Refusing to reuse a nonempty folder without a manifest: {destination}")
+        if destination.exists() and any(destination.iterdir()):
+            raise ValueError(f"Refusing to reuse a nonempty input folder without a manifest: {destination}")
         manifest = {**identity, "complete": False, "pages": [], "files": [], "created_at": now()}
         manifest["versions"] = {name: version(name) for name in ("pymupdf", "pymupdf4llm", "numpy", "Pillow")}
+    destination.mkdir(parents=True, exist_ok=True)
     manifest.update(settings=settings, complete=False)
     write_json(manifest_path, manifest)
-    converted = destination / "source.pdf"
-    if not converted.exists():
-        if source.suffix.lower() == ".pdf":
-            data = source.read_bytes()
-            valid_pdf(data)
-            atomic_write(converted, data)
-            manifest["converter"] = "copy"
-        else:
-            manifest["converter"] = convert_office(source, converted, config)
-        write_json(manifest_path, manifest)
     import pymupdf4llm
 
     # Native per-page hints avoid inventing DOCX page boundaries with whole-document text.
     hint_options = {"use_ocr": False} if "use_ocr" in inspect.signature(pymupdf4llm.to_markdown).parameters else {}
-    files, pages = ["source.pdf"], []
-    with pymupdf.open(converted) as document:
-        for index, page in enumerate(document):
-            stem = f"page_{index + 1:04d}"
-            original = destination / "original" / f"{stem}.pdf"
-            if not original.exists():
-                with pymupdf.open() as single:
-                    single.insert_pdf(document, from_page=index, to_page=index)
-                    atomic_write(original, single.tobytes(garbage=4, deflate=True))
-            image = pdf_image(original, args.dpi)
-            png = original.with_suffix(".png")
-            if not png.exists():
-                stream = io.BytesIO()
-                image.save(stream, format="PNG")
-                atomic_write(png, stream.getvalue())
-            hint_path = original.with_suffix(".hint.json")
-            if not hint_path.exists():
-                hint = {"native_text": page.get_text(sort=True), "markdown": "",
-                        "extractor": "pymupdf4llm (OCR disabled)", "verified": False}
-                try:
-                    hint["markdown"] = pymupdf4llm.to_markdown(document, pages=[index],
-                                                             show_progress=False, **hint_options)
-                except Exception as error:
-                    hint["extractor"] = "pymupdf native text (fallback)"
-                    hint["extraction_error"] = str(error)
-                write_json(hint_path, hint)
-            raster = destination / "chars_rem" / f"{stem}.pdf"
-            if not raster.exists():
-                atomic_write(raster, image_pdf(image, page.rect.width, page.rect.height))
-            augmentations = {}
-            for name, specification in variants.items():
-                profile, severity = specification["profile"], specification["severity"]
-                target = destination / "augmented" / f"{stem}_{name}.pdf"
-                metadata = target.with_suffix(".json")
-                if not target.exists() or not metadata.exists():
-                    seed = page_seed(identity["source_sha256"], index + 1, profile, args.seed)
-                    degraded, parameters = augment(image, profile, seed, severity)
-                    if not target.exists():
-                        atomic_write(target, image_pdf(degraded, page.rect.width, page.rect.height))
-                    if not metadata.exists():
-                        write_json(metadata, parameters)
-                augmentations[name] = read_json(metadata)
-                files.extend([str(target.relative_to(destination)), str(metadata.relative_to(destination))])
-            files.extend(str(p.relative_to(destination)) for p in (original, png, hint_path, raster))
-            pages.append({"page": index + 1, "width": page.rect.width, "height": page.rect.height,
-                          "augmentations": augmentations})
-            print(f"[prepare] {source.name}: page {index + 1}/{len(document)}", flush=True)
-    manifest.update(complete=True, files=files, pages=pages, completed_at=now())
+    files, pages = [], []
+    if source.suffix.lower() == ".pdf":
+        converted = source
+    else:
+        converted = root / "cache" / "convert" / f"{document}.pdf"
+        if not converted.is_file():
+            manifest["converter"] = convert_office(source, converted, config)
+            write_json(manifest_path, manifest)
+    with pymupdf.open(converted) as converted_pdf:
+        count = len(converted_pdf)
+    job = (root, converted, document, identity, args, hint_options, recorded)
+    pool = ProcessPoolExecutor(max_workers=args.workers) if args.workers > 1 else None
+    try:
+        futures = ([pool.submit(prepare_page, *job, index) for index in range(count)]
+                   if pool else [])
+        for index in range(count):  # Collected in page order, so logs and the manifest stay stable.
+            names, page = futures[index].result() if pool else prepare_page(*job, index)
+            files.extend(names)
+            pages.append(page)
+            print(f"[prepare] {source.name}: page {index + 1}/{count}", flush=True)
+    finally:
+        if pool:
+            pool.shutdown()
+    manifest.update(complete=True, files=sorted(files), pages=pages, completed_at=now())
     write_json(manifest_path, manifest)
     return True
-
-
 def isolated_environment(venv):
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
@@ -400,17 +408,18 @@ def pipeline_command(setup, source, output, attempt):
     return command
 
 
-def parse_page(source, output, setup, attempt, config):
-    destination = output / f"{source.stem}_attempt{attempt}.md"
-    marker = destination.with_suffix(".run.json")
+def parse_page(source, root, pipeline, document, setup, attempt, config):
+    markdown = root / "output" / pipeline / document / f"{source.stem}_attempt{attempt}.md"
+    scratch = root / "cache" / "parse" / pipeline / document
+    marker = scratch / f"{source.stem}_attempt{attempt}.run.json"
     run = read_json(marker, {})
     input_hash = digest(source)
-    if destination.is_file() and run.get("input_sha256") == input_hash:
-        if run.get("markdown_sha256") == digest(destination):
-            print(f"[parse] Skip {destination}", flush=True)
+    if markdown.is_file() and run.get("input_sha256") == input_hash:
+        if run.get("markdown_sha256") == digest(markdown):
+            print(f"[parse] Skip {markdown}", flush=True)
             return False
     # Each invocation gets a fresh directory so a failed retry cannot publish stale output.
-    artifacts = output / ".artifacts" / (destination.stem + "_" + uuid.uuid4().hex[:12])
+    artifacts = scratch / f"{source.stem}_attempt{attempt}" / uuid.uuid4().hex[:12]
     artifacts.mkdir(parents=True)
     command = pipeline_command(setup, source, artifacts, attempt)
     started = time.monotonic()
@@ -421,57 +430,54 @@ def parse_page(source, output, setup, attempt, config):
     if len(markdowns) != 1:
         raise RuntimeError(f"Expected one full-page Markdown, found {len(markdowns)} in {artifacts}")
     content = markdowns[0].read_text(encoding="utf-8")
-    atomic_write(destination, content)
-    write_json(marker, {"input_sha256": input_hash, "markdown_sha256": digest(destination),
-                        "artifact_markdown": str(markdowns[0].relative_to(output)),
-                        "artifact_root": str(artifacts.relative_to(output)), "command": command,
+    atomic_write(markdown, content)
+    write_json(marker, {"input_sha256": input_hash, "markdown_sha256": digest(markdown),
+                        "artifact_markdown": str(markdowns[0].relative_to(scratch)),
+                        "artifact_root": str(artifacts.relative_to(scratch)), "command": command,
                         "versions": setup[2], "elapsed_seconds": time.monotonic() - started,
                         "attempt": attempt, "completed_at": now()})
-    print(f"[parse] Wrote {destination}", flush=True)
+    print(f"[parse] Wrote {markdown}", flush=True)
     return True
-
-
 def candidates(root, args):
-    for document in sorted((root / "output").iterdir()):
-        if not document.is_dir() or (args.documents and document.name not in args.documents):
+    selected = set(args.variants or VARIANTS)
+    for pipeline in args.pipelines or PIPELINES:
+        folder = root / "output" / pipeline
+        if not folder.is_dir():
             continue
-        for pipeline in args.pipelines or PIPELINES:
-            for variant in args.variants:
-                for markdown in sorted((document / pipeline / variant).glob("page_*_attempt*.md")):
+        for document in sorted(folder.iterdir()):
+            if not document.is_dir() or (args.documents and document.name not in args.documents):
+                continue
+            for markdown in sorted(document.glob("page_*_attempt*.md")):
+                kind = markdown_type(markdown.stem)
+                if kind in selected or variant_of(kind) in selected:
                     yield markdown
-
-
 def score_sources(root, markdown):
-    document, pipeline, variant, filename = markdown.relative_to(root / "output").parts
-    match = re.fullmatch(r"(page_\d+)(?:_([a-z][a-z0-9_]*))?_attempt(\d+)\.md", filename)
+    pipeline, document, filename = markdown.relative_to(root / "output").parts
+    match = re.fullmatch(r"(page_\d+)_([a-z][a-z0-9_]*)_attempt(\d+)\.md", filename)
     if not match:
         raise ValueError(f"Invalid output filename: {markdown}")
-    page, profile, attempt = match.groups()
-    reference = root / "input" / document / "original" / f"{page}.pdf"
-    stem = page + ("_" + profile if profile else "")
-    source = root / "input" / document / variant / f"{stem}.pdf"
-    run = read_json(markdown.with_suffix(".run.json"), {})
+    page, kind, attempt = match.groups()
+    variant = variant_of(kind)
+    reference = root / "input" / document / f"{page}_{ORIGINAL}.pdf"
+    source = root / "input" / document / f"{page}_{kind}.pdf"
+    scratch = root / "cache" / "parse" / pipeline / document
+    run = read_json(scratch / f"{page}_{kind}_attempt{attempt}.run.json", {})
     if run and run.get("input_sha256") != digest(source):
         raise ValueError(f"Parsed output belongs to a different input; rerun --parse: {markdown}")
-    asset_base = markdown.parent
-    asset_root = markdown.parent
+    asset_base = asset_root = markdown.parent
     if run.get("artifact_markdown"):
-        asset_base = (markdown.parent / run["artifact_markdown"]).resolve().parent
-        asset_root = (markdown.parent / run["artifact_root"]).resolve()
-        if not asset_base.is_relative_to(markdown.parent.resolve()) or not asset_root.is_relative_to(
-                markdown.parent.resolve()):
-            raise ValueError("Artifact path escapes output directory")
+        asset_base = (scratch / run["artifact_markdown"]).parent.resolve()
+        asset_root = (scratch / run["artifact_root"]).resolve()
+        if not asset_base.is_relative_to(scratch.resolve()) or not asset_root.is_relative_to(scratch.resolve()):
+            raise ValueError("Artifact path escapes the parse cache directory")
     return {"document": document, "pipeline": pipeline, "variant": variant,
-            "page": page, "profile": profile, "attempt": int(attempt),
+            "page": page, "profile": kind if variant == "augmented" else None, "attempt": int(attempt),
             "reference": reference, "input": source,
-            "hint": reference.with_suffix(".hint.json"), "asset_base": asset_base,
+            "hint": root / "cache" / "hint" / document / f"{page}.json", "asset_base": asset_base,
             "asset_root": asset_root}
-
-
 def judge_settings(config, dpi):
     return {"base_url": config.get("LLM_BASE_URL", "").rstrip("/"),
             "model": config.get("LLM_MODEL", ""), "dpi": dpi,
-            "max_tokens": int(config.get("LLM_MAX_TOKENS", 4096)),
             "prompt_sha256": hashlib.sha256(PROMPT.encode()).hexdigest(),
             "render_version": RENDER_VERSION,
             "render_packages": {name: version(name) for name in ("playwright", "markdown-it-py", "pymupdf", "Pillow")}}
@@ -483,8 +489,7 @@ def fingerprint(markdown, sources, settings):
               "hint": digest(sources["hint"]) if sources["hint"].exists() else None}
     hashes["assets"] = {str(p.relative_to(sources["asset_root"])): digest(p)
                         for p in sorted(sources["asset_root"].rglob("*")) if p.is_file()
-                        and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg")
-                        and ".judge" not in p.relative_to(sources["asset_root"]).parts}
+                        and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg")}
     value = json.dumps({"files": hashes, "judge": settings}, sort_keys=True).encode()
     return hashlib.sha256(value).hexdigest()
 
@@ -499,7 +504,6 @@ def chat(config, content):
     if not base or not config.get("LLM_MODEL"):
         raise ValueError("Set LLM_BASE_URL and LLM_MODEL in benchmark/.env")
     payload = {"model": config["LLM_MODEL"], "temperature": 0,
-               "max_tokens": int(config.get("LLM_MAX_TOKENS", 4096)),
                "messages": [{"role": "user", "content": content}],
                "response_format": {"type": "json_object"}}
     headers = {"Content-Type": "application/json"}
@@ -562,12 +566,42 @@ def redo_matches(root, markdown, redo):
 
 
 def score_all(root, args, config):
-    database = root / "scores.json"
+    database = root / "score" / "scores.json"
     scores = read_json(database, {"schema_version": 1, "records": {}})
     settings = judge_settings(config, args.judge_dpi)
     processed, failures = 0, 0
     # Launch Chromium only when there is an unscored or changed page.
     renderer = None
+    pending = []
+
+    def judge_pending():
+        nonlocal failures
+        if not pending:
+            return
+        with ThreadPoolExecutor(max_workers=SCORE_CONCURRENCY) as executor:
+            futures = {executor.submit(chat, config, job["content"]): job for job in pending}
+            for future in as_completed(futures):
+                job = futures[future]
+                key = job["key"]
+                previous = job["previous"]
+                try:
+                    judgment, response = future.result()
+                    write_json(job["folder"] / "response.json", response)
+                    metrics = validate_judgment(judgment)
+                    record = {key: value for key, value in job["sources"].items()
+                              if key in ("document", "pipeline", "variant", "page", "profile", "attempt")}
+                    record.update(status="complete", fingerprint=job["identity"], judge=settings,
+                                  **metrics, judgment=judgment, rendering=job["rendering"], scored_at=now())
+                    scores["records"][key] = record
+                    print(f"[score] {key}: {metrics['score']} estimated mistakes", flush=True)
+                except Exception as error:
+                    failures += 1
+                    scores["records"][key] = {**previous, "status": "error", "error": str(error),
+                                              "failed_at": now()}
+                    print(f"[score] ERROR {key}: {error}", file=sys.stderr, flush=True)
+                write_json(database, scores)
+        pending.clear()
+
     try:
         for markdown in candidates(root, args):
             key = str(markdown.relative_to(root / "output"))
@@ -585,7 +619,7 @@ def score_all(root, args, config):
                 print(f"[score] Judging {key}", flush=True)
                 if renderer is None:
                     renderer = MarkdownRenderer().__enter__()
-                folder = markdown.parent / ".judge" / markdown.stem
+                folder = root / "score" / sources["pipeline"] / sources["document"] / markdown.stem
                 folder.mkdir(parents=True, exist_ok=True)
                 reference_image = pdf_image(sources["reference"], args.judge_dpi)
                 reference_image.save(folder / "reference.png")
@@ -597,27 +631,24 @@ def score_all(root, args, config):
                 hint = read_json(sources["hint"], {"native_text": "", "verified": False})
                 data = json.dumps({"reference_hint_unverified": hint, "candidate_markdown": content},
                                   ensure_ascii=False)
-                judgment, response = chat(config, [
-                    {"type": "text", "text": PROMPT},
-                    {"type": "text", "text": "IMAGE 1: ORIGINAL reference page"},
-                    image_content((folder / "reference.png").read_bytes()),
-                    {"type": "text", "text": "IMAGE 2: candidate Markdown rendering"},
-                    image_content((folder / "candidate.png").read_bytes()),
-                    {"type": "text", "text": "UNTRUSTED DOCUMENT DATA:\n" + data}])
-                write_json(folder / "response.json", response)
-                metrics = validate_judgment(judgment)
-                record = {key: value for key, value in sources.items()
-                          if key in ("document", "pipeline", "variant", "page", "profile", "attempt")}
-                record.update(status="complete", fingerprint=identity, judge=settings, **metrics,
-                              judgment=judgment, rendering=rendering, scored_at=now())
-                scores["records"][key] = record
-                print(f"[score] {key}: {metrics['score']} estimated mistakes", flush=True)
+                pending.append({"key": key, "previous": previous, "sources": sources,
+                                "identity": identity, "folder": folder, "rendering": rendering,
+                                "content": [
+                                    {"type": "text", "text": PROMPT},
+                                    {"type": "text", "text": "IMAGE 1: ORIGINAL reference page"},
+                                    image_content((folder / "reference.png").read_bytes()),
+                                    {"type": "text", "text": "IMAGE 2: candidate Markdown rendering"},
+                                    image_content((folder / "candidate.png").read_bytes()),
+                                    {"type": "text", "text": "UNTRUSTED DOCUMENT DATA:\n" + data}]})
+                if len(pending) >= SCORE_CONCURRENCY:
+                    judge_pending()
             except Exception as error:
                 failures += 1
                 scores["records"][key] = {**previous, "status": "error", "error": str(error),
                                           "failed_at": now()}
                 print(f"[score] ERROR {key}: {error}", file=sys.stderr, flush=True)
-            write_json(database, scores)
+                write_json(database, scores)
+        judge_pending()
     finally:
         if renderer:
             renderer.__exit__(None, None, None)
@@ -625,7 +656,7 @@ def score_all(root, args, config):
 
 
 def rank_pages(root, args, config):
-    scores = read_json(root / "scores.json", {"records": {}})
+    scores = read_json(root / "score" / "scores.json", {"records": {}})
     settings = judge_settings(config, args.judge_dpi)
     groups = defaultdict(lambda: defaultdict(list))
     stale = 0
@@ -646,12 +677,12 @@ def rank_pages(root, args, config):
         ranking.append({"document": document, "page": page, "mean_mistakes": statistics.mean(means),
                         "worst_mean_mistakes": max(means), "pipeline_variant_groups": len(samples),
                         "scored_attempts": sum(len(attempts) for attempts in samples.values()),
-                        "original_pdf": str(Path("input") / document / "original" / f"{page}.pdf"),
+                        "original_pdf": str(Path("input") / document / f"{page}_{ORIGINAL}.pdf"),
                         "breakdown": [{"pipeline": pipeline, "variant": variant, "profile": profile,
                                        "mean_mistakes": statistics.mean(attempts), "attempts": len(attempts)}
                                       for (pipeline, variant, profile), attempts in samples.items()]})
     ranking.sort(key=lambda row: (-row["mean_mistakes"], row["document"], row["page"]))
-    destination = args.export or root / "difficult_pages.json"
+    destination = args.export or root / "score" / "ranking.json"
     write_json(destination, {"created_at": now(), "aggregation": "mean of per-pipeline/variant/profile attempt means",
                              "stale_scores_ignored": stale, "pages": ranking[:args.top]})
     for row in ranking[:args.top]:
@@ -697,11 +728,10 @@ def main(argv=None):
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS))
     parser.add_argument("--attempts", type=positive_int, default=3)
     parser.add_argument("--dpi", type=positive_int, default=300, help="Preparation raster DPI")
+    parser.add_argument("--workers", type=positive_int, default=4,
+                        help="Prepare pages across this many processes; 1 disables parallelism")
     parser.add_argument("--judge-dpi", type=positive_int, default=180)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--augmentations", nargs="+", choices=PROFILES, default=list(PROFILES))
-    parser.add_argument("--severities", nargs="+", choices=SEVERITIES, default=list(SEVERITIES),
-                        help="Augmentation strengths; new selections append to existing inputs")
     parser.add_argument("--redo", nargs="?", const="*", help="With --score: redo all, or a specific output path")
     parser.add_argument("--limit", type=positive_int, help="Limit new documents/parse attempts/judgments")
     parser.add_argument("--top", type=positive_int, default=200)
@@ -712,7 +742,7 @@ def main(argv=None):
     config = {**dotenv_values(args.env), **os.environ}
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(HERE / ".browsers"))
     root = args.io_dir.expanduser().resolve()
-    for name in ("raw", "input", "output"):
+    for name in ("raw", "input", "output", "score", "cache"):
         (root / name).mkdir(parents=True, exist_ok=True)
     try:
         if args.redo and args.redo != "*":
@@ -732,13 +762,13 @@ def main(argv=None):
                 return 0
             failures, processed = 0, 0
             if args.prepare:
-                jobs = [(source, root / "input" / name) for source, name in source_documents(root)
+                jobs = [(source, name) for source, name in source_documents(root)
                         if not args.documents or name in args.documents]
-                for source, destination in jobs:
+                for source, name in jobs:
                     if args.limit and processed >= args.limit:
                         break
                     try:
-                        processed += prepare_document(source, destination, args, config)
+                        processed += prepare_document(root, source, name, args, config)
                     except Exception as error:
                         failures += 1
                         processed += 1
@@ -748,25 +778,25 @@ def main(argv=None):
                 if not names:
                     raise ValueError("No pipelines configured; set the *_VENV paths in benchmark/.env")
                 setups = {name: pipeline_setup(name, config, args.env.resolve().parent) for name in names}
+                selected = set(args.variants)
                 for document in sorted((root / "input").iterdir()):
                     if not document.is_dir() or (args.documents and document.name not in args.documents):
                         continue
-                    manifest = read_json(document / "manifest.json", {})
-                    if not manifest.get("complete"):
+                    if not read_json(root / "cache" / "input" / f"{document.name}.json", {}).get("complete"):
                         raise ValueError(f"Preparation is incomplete for {document.name}; run --prepare first")
+                    inputs = [source for source in sorted(document.glob("page_*.pdf"))
+                              if page_type(source.stem) in selected or variant_of(page_type(source.stem)) in selected]
                     for name, setup in setups.items():
-                        for variant in args.variants:
-                            for source in sorted((document / variant).glob("page_*.pdf")):
-                                for attempt in range(1, args.attempts + 1):
-                                    if args.limit and processed >= args.limit:
-                                        return int(bool(failures))
-                                    try:
-                                        processed += parse_page(source, root / "output" / document.name / name / variant,
-                                                                setup, attempt, config)
-                                    except Exception as error:
-                                        failures += 1
-                                        processed += 1
-                                        print(f"[parse] ERROR {source}: {error}", file=sys.stderr, flush=True)
+                        for source in inputs:
+                            for attempt in range(1, args.attempts + 1):
+                                if args.limit and processed >= args.limit:
+                                    return int(bool(failures))
+                                try:
+                                    processed += parse_page(source, root, name, document.name, setup, attempt, config)
+                                except Exception as error:
+                                    failures += 1
+                                    processed += 1
+                                    print(f"[parse] ERROR {source}: {error}", file=sys.stderr, flush=True)
             print(f"[done] {processed} processed items, {failures} failures", flush=True)
             return int(bool(failures))
     except (Exception, KeyboardInterrupt) as error:

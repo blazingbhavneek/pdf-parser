@@ -74,8 +74,13 @@ class MarkdownRenderer:
                 route.abort()
                 return
             relative = unquote(parsed.path).lstrip("/")
-            candidate = (asset_root / relative).resolve()
-            if not candidate.is_relative_to(asset_root.resolve()) or not candidate.is_file():
+            root = asset_root.resolve()
+            # Relative paths resolve inside the run's artifact root; parsers such as
+            # Docling's `referenced` export write absolute paths into that same root.
+            candidate = next((path for path in ((asset_root / relative).resolve(),
+                                                Path("/" + relative).resolve())
+                              if path.is_relative_to(root) and path.is_file()), None)
+            if candidate is None:
                 missing.append(relative)
                 route.abort()
                 return
