@@ -8,10 +8,14 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import statistics
+import subprocess
 import sys
 import tempfile
 import threading
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 import time
 import unittest
 from unittest.mock import patch
@@ -25,6 +29,7 @@ from benchmark.datagen.augment import SPAN, VERSION, augment
 from benchmark.datagen.render import MarkdownRenderer, pdf_image
 from benchmark.datagen.premade import japanese_public_setup as public
 from benchmark.datagen.premade import japanese_stress_setup as premade
+from docx_converter import client as docx_client, server as docx_server
 
 
 def judgment():
@@ -308,40 +313,129 @@ class BenchmarkTest(unittest.TestCase):
         self.assertEqual(names[".pdf"], "日本語")
         self.assertEqual(names[".docx"], "日本語__docx")
 
-    def test_office_endpoint_multipart_and_invalid_pdf_fallback(self):
+    def fake_docx_conversion(self, pages=("日本語 駅 カタカナ ひらがな", "会社の業務報告書")):
+        """Stand-in for the Word server: whole PDF plus one Pandoc-made DOCX per page."""
+        def convert(source, folder, *args):
+            (folder / "pages").mkdir(parents=True)
+            (folder / "document.pdf").write_bytes(self.source.read_bytes())
+            for number, text in enumerate(pages, 1):
+                subprocess.run(["pandoc", "-f", "markdown", "-t", "docx", "-o",
+                                str(folder / "pages" / f"page_{number:04d}.docx")], input=text, text=True, check=True)
+            bench.write_json(folder / "pages.json", {"converter": "word", "pages": [
+                {"page": number, "header": "", "footer": ""} for number in range(1, len(pages) + 1)]})
+            return "word"
+        return convert
+
+    @unittest.skipUnless(shutil.which("pandoc"), "pandoc is not installed")
+    def test_docx_goes_to_word_converter_and_pptx_to_libreoffice(self):
         source = self.root / "raw" / "日本語.docx"
         source.write_bytes(b"fake-office-file")
-        target = self.root / "converted.pdf"
-        config = {"CONVERTER_URL": "http://converter/convert", "CONVERTER_API_KEY": "test-token"}
-        with patch.object(bench, "request_bytes", return_value=self.source.read_bytes()) as request:
-            self.assertEqual(bench.convert_office(source, target, config), "endpoint")
-        self.assertIn(b'name="file"', request.call_args.args[1])
-        self.assertIn(b"fake-office-file", request.call_args.args[1])
-        self.assertEqual(request.call_args.args[2]["Authorization"], "Bearer test-token")
+        target = self.root / "cache" / "convert" / "日本語.pdf"
+        config = {"CONVERTER_URL": "http://laptop:8765/convert", "CONVERTER_API_KEY": "test-token"}
+        with patch.object(bench, "convert_docx", side_effect=self.fake_docx_conversion()) as convert:
+            self.assertEqual(bench.convert_office(source, target, config), "word")
+            self.assertEqual(bench.convert_office(source, target, config), "word")  # Reuses the folder.
+        self.assertEqual(convert.call_count, 1)
+        self.assertEqual(convert.call_args.args[2:4], ("http://laptop:8765/convert", "test-token"))
+        bench.valid_pdf(target.read_bytes())
+
+        slides = self.root / "raw" / "日本語.pptx"
+        slides.write_bytes(b"fake-office-file")
 
         def fake_office(command, log, timeout):
             folder = Path(command[command.index("--outdir") + 1])
-            (folder / (source.stem + ".pdf")).write_bytes(self.source.read_bytes())
+            (folder / (slides.stem + ".pdf")).write_bytes(self.source.read_bytes())
 
-        with patch.object(bench, "request_bytes", return_value=b"not a PDF"), \
-                patch.object(bench, "run_process", side_effect=fake_office):
-            self.assertEqual(bench.convert_office(source, target, config), "libreoffice")
-        bench.valid_pdf(target.read_bytes())
+        with patch.object(bench, "run_process", side_effect=fake_office):
+            self.assertEqual(bench.convert_office(slides, self.root / "slides.pdf", config), "libreoffice")
 
-    def test_prepare_converts_office_into_cache_and_keeps_input_pdfs_only(self):
+    @unittest.skipUnless(shutil.which("pandoc"), "pandoc is not installed")
+    def test_prepare_converts_docx_and_writes_gold_markdown_per_page(self):
         source = self.root / "raw" / "報告書.docx"
         source.write_bytes(b"fake-office-file")
-        config = {"CONVERTER_URL": "http://converter/convert"}
-        with patch.object(bench, "request_bytes", return_value=self.source.read_bytes()) as request:
-            self.assertTrue(bench.prepare_document(self.root, source, "報告書", self.args, config))
-        self.assertEqual(request.call_count, 1)
+        with patch.object(bench, "convert_docx", side_effect=self.fake_docx_conversion()):
+            self.assertTrue(bench.prepare_document(self.root, source, "報告書", self.args, {}))
         self.assertEqual(sorted(p.name for p in (self.root / "input" / "報告書").iterdir()),
                          [f"page_{page:04d}_{kind}.pdf" for page in (1, 2)
                           for kind in ("aug", "chars_rem", "original")])
         manifest = bench.read_json(self.root / "cache" / "input" / "報告書.json")
-        self.assertEqual(manifest["converter"], "endpoint")
-        self.assertTrue((self.root / "cache" / "convert" / "報告書.pdf").is_file())
-        self.assertFalse(bench.prepare_document(self.root, source, "報告書", self.args, config))
+        self.assertEqual(manifest["converter"], "word")
+        gold = self.root / "gold" / "報告書"
+        self.assertEqual((gold / "page_0002.md").read_text(encoding="utf-8"), "会社の業務報告書\n")
+        self.assertEqual([row["agreement"] for row in bench.read_json(gold / "pages.json")], [1.0, 1.0])
+        self.assertFalse(bench.prepare_document(self.root, source, "報告書", self.args, {}))
+        self.assertLess(bench.agreement("| 統計値 |", "統計值"), 1)
+        self.assertEqual(bench.agreement("本文", "社外秘 本文", furniture="社外秘"), 1.0)
+
+    def test_gold_score_counts_letters_leaks_headers_and_tables(self):
+        from benchmark import gold
+
+        gold_page = ("# 第7条 統計値の確認\n\n売上は10%増えた。\n\n"
+                     "<table><tr><th>項目</th><th>金額</th></tr><tr><td>売上</td><td>10円</td></tr>"
+                     "<tr><td>利益</td><td>3円</td></tr></table>\n")
+        predicted = ("社外秘\n\n## 第８条 統計值の確認\n\n売上は１１％増えた。\n\n"
+                     "| 項目 | 金額 |\n|---|---|\n| 利益 | 3円 |\n")
+        record = gold.score_page(gold_page, predicted, ["社外秘", ""], gold.japanese())
+        # Only kana/kanji/Latin count (tables too): 7→８, 10→１１ and %→％ are ignored; 値→值 is one edit
+        # and one leak, the missing 売上 | 10円 row three more.
+        self.assertEqual((record["gold_letters"], record["edits"]), (24, 4))
+        self.assertEqual(record["leaks"], ["值"])
+        self.assertEqual(record["substitutions"], [["値", "值"]])
+        self.assertEqual(record["runs_found"], record["runs"] - 1)
+        table = record["tables"][0]
+        self.assertLess(table["teds"], 1)
+        self.assertEqual((table["cell_edits"], table["cell_chars"]), (5, 13))  # Only the missing 売上 | 10円 row.
+
+    def test_word_server_round_trip_requires_token(self):
+        received = []
+
+        def fake_word(source, output):
+            received.append(source.read_bytes())
+            (output / "pages").mkdir(parents=True)
+            (output / "document.pdf").write_bytes(self.source.read_bytes())
+            (output / "pages" / "page_0001.docx").write_bytes(b"page one")
+            (output / "pages.json").write_text('{"converter": "word", "pages": []}')
+
+        server = docx_server.HTTPServer(("127.0.0.1", 0), docx_server.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        with patch.object(docx_server.Handler, "token", "secret"), \
+                patch.object(docx_server.Handler, "convert", staticmethod(fake_word)):
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_address[1]}/convert"
+                upload = self.root / "日本語.docx"
+                upload.write_bytes(b"PK\x03\x04 binary \r\n--boundary-like\r\n bytes")
+                folder = self.root / "converted"
+                self.assertEqual(docx_client.convert(upload, folder, url, "secret"), "word")
+                self.assertEqual(received, [upload.read_bytes()])
+                self.assertEqual(sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*.*")),
+                                 ["document.pdf", "pages.json", "pages/page_0001.docx"])
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(Request(url, b"x", {"Authorization": "Bearer wrong"}), timeout=5)
+                self.assertEqual(denied.exception.code, 401)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    @unittest.skipUnless(shutil.which("pandoc") and shutil.which("soffice") and subprocess.run(
+        ["/usr/bin/python3", "-c", "import uno"], capture_output=True).returncode == 0,
+        "needs pandoc, LibreOffice and a Python with uno")
+    def test_libreoffice_fallback_splits_real_pages_with_continued_numbering(self):
+        lines = ["# 社内規程", ""] + [f"{i}. 第{i}項目の本文です。会社の業務報告書と統計値を確認します。\n"
+                                       for i in range(1, 41)]
+        lines += ["| 項目 | 金額 |", "|---|---|"] + [f"| 売上高{i} | {i * 100}円 |" for i in range(30)]
+        source = self.root / "規程.docx"
+        subprocess.run(["pandoc", "-f", "markdown", "-o", str(source)], input="\n".join(lines),
+                       text=True, check=True)
+        folder = self.root / "cache" / "convert" / "規程"
+        self.assertEqual(docx_client.convert(source, folder), "libreoffice")
+        bench.write_gold(self.root, "規程", folder)
+        rows = bench.read_json(self.root / "gold" / "規程" / "pages.json")
+        self.assertGreater(len(rows), 2)
+        # The last page loses only the table header row LibreOffice repeats there.
+        self.assertTrue(all(row["agreement"] > 0.95 for row in rows), rows)
+        second = (self.root / "gold" / "規程" / "page_0002.md").read_text(encoding="utf-8")
+        self.assertNotRegex(second.lstrip(), r"^1\\?\. ")  # List numbers continue, not restart.
 
     def test_pipeline_isolated_attempts_resume_and_retain_assets(self):
         self.prepare()
@@ -359,7 +453,7 @@ class BenchmarkTest(unittest.TestCase):
         self.assertTrue(bench.parse_page(source, self.root, "mineru", "日本語", setup, 1, config))
         self.assertFalse(bench.parse_page(source, self.root, "mineru", "日本語", setup, 1, config))
         self.assertTrue(bench.parse_page(source, self.root, "mineru", "日本語", setup, 2, config))
-        self.assertEqual([p.name for p in output.iterdir()],
+        self.assertEqual(sorted(p.name for p in output.iterdir()),
                          ["page_0001_original_attempt1.md", "page_0001_original_attempt2.md"])
         marker = bench.read_json(scratch / "page_0001_original_attempt1.run.json")
         self.assertIn("versions", marker)

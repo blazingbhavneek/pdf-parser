@@ -1,13 +1,21 @@
 [project]
 name = "pdf-parser"
 version = "0.1.0"
-description = "Add your description here"
+description = "Japanese PDF to Markdown: OCR lattices, constrained VLM fill-in, HTML tables"
 readme = "README.md"
 authors = [
     { name = "blazingbhavneek", email = "bhavneek2002@gmail.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "httpx>=0.28,<1",
+    "pillow>=11",
+    "pymupdf>=1.26,<2",
+]
+
+[project.optional-dependencies]
+# The faithfulness judge renders Markdown with the benchmark's Playwright renderer.
+judge = ["markdown-it-py>=3", "playwright>=1.50,<2"]
 
 [project.scripts]
 pdf-parser = "pdf_parser:main"

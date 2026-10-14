@@ -3,12 +3,13 @@
 
 import argparse
 import base64
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import html
 import inspect
 import io
 from importlib.metadata import version
@@ -18,12 +19,14 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import uuid
@@ -37,8 +40,9 @@ from dotenv import dotenv_values
 
 from benchmark.datagen.augment import AUG, VERSION as AUGMENT_VERSION, augment, page_seed
 from benchmark.datagen.render import MarkdownRenderer, VERSION as RENDER_VERSION, image_pdf, pdf_image
+from docx_converter.client import convert as convert_docx
 
-PIPELINES = ("mineru", "docling", "paddle", "dots")
+PIPELINES = ("mineru", "docling", "paddle", "dots", "ours")
 VARIANTS = ("original", "chars_rem", "augmented")
 ORIGINAL, CHARS_REM = "original", "chars_rem"
 COUNTS = ("character_substitutions", "character_deletions", "character_insertions",
@@ -195,23 +199,17 @@ def valid_pdf(data):
 
 
 def convert_office(source, target, config):
-    endpoint = config.get("CONVERTER_URL")
-    if endpoint:
-        boundary = uuid.uuid4().hex
-        filename = source.name.replace('"', "_").replace("\r", "_").replace("\n", "_")
-        body = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
-                f'filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'
-                ).encode() + source.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
-        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
-        if config.get("CONVERTER_API_KEY"):
-            headers["Authorization"] = "Bearer " + config["CONVERTER_API_KEY"]
-        try:
-            data = request_bytes(endpoint, body, headers, float(config.get("CONVERTER_TIMEOUT", 180)))
-            valid_pdf(data)
-            atomic_write(target, data)
-            return "endpoint"
-        except Exception as error:
-            print(f"[prepare] Converter failed ({error}); using LibreOffice", flush=True)
+    if source.suffix.lower() == ".docx":
+        # Word server (or local LibreOffice) gives the PDF plus one DOCX per rendered page.
+        folder = target.with_suffix("")
+        converter = (read_json(folder / "pages.json") or {}).get("converter") or convert_docx(
+            source, folder, config.get("CONVERTER_URL"), config.get("CONVERTER_API_KEY"),
+            float(config.get("CONVERTER_TIMEOUT", 600)), config.get("LIBREOFFICE_PYTHON"),
+            config.get("LIBREOFFICE_BIN"))
+        data = (folder / "document.pdf").read_bytes()
+        valid_pdf(data)
+        atomic_write(target, data)
+        return converter
     with tempfile.TemporaryDirectory(prefix="office-", dir=target.parent) as temporary:
         folder = Path(temporary)
         command = [config.get("LIBREOFFICE_BIN") or "libreoffice",
@@ -226,6 +224,43 @@ def convert_office(source, target, config):
         valid_pdf(data)
         atomic_write(target, data)
     return "libreoffice"
+
+
+def agreement(markdown, drawn, furniture=""):
+    """Share of letters/digits Pandoc and the PDF page agree on; header/footer text is ignored."""
+    def characters(text):
+        return Counter(c for c in unicodedata.normalize("NFC", text) if c.isalnum())
+
+    markdown = html.unescape(re.sub(r"!\[[^\]]*\]\([^)]*\)|<[^>]+>|\]\([^)]*\)", " ", markdown))
+    expected, found = characters(markdown), characters(drawn) - characters(furniture)
+    total = max(sum(expected.values()), sum(found.values()))
+    return round(sum((expected & found).values()) / total, 4) if total else 1.0
+
+
+def write_gold(root, document, folder):
+    """Pandoc Markdown for each Word page beside the PDF it came from; low agreement means review."""
+    destination = root / "gold" / document
+    if (destination / "pages.json").exists():
+        return
+    if not shutil.which("pandoc"):
+        print("[prepare] pandoc not found; no gold Markdown", flush=True)
+        return
+    furniture = read_json(folder / "pages.json")["pages"]
+    sources = sorted((folder / "pages").glob("page_*.docx"))
+    rows = []
+    with pymupdf.open(folder / "document.pdf") as pdf:
+        if len(pdf) != len(sources):
+            print(f"[prepare] {document}: {len(pdf)} PDF pages but {len(sources)} page DOCX; no gold", flush=True)
+            return
+        for page, source, extra in zip(pdf, sources, furniture):
+            markdown = subprocess.run(["pandoc", str(source), "--from=docx", "--to=gfm", "--wrap=none"],
+                                      capture_output=True, text=True, check=True).stdout
+            atomic_write(destination / f"{source.stem}.md", markdown)
+            edges = " ".join(filter(None, (extra.get("header"), extra.get("footer"))))
+            rows.append({"page": extra["page"], "header": extra.get("header"), "footer": extra.get("footer"),
+                         "agreement": agreement(markdown, page.get_text(), edges),
+                         "images": markdown.count("![") + markdown.count("<img")})
+    write_json(destination / "pages.json", rows)
 
 
 def source_documents(root):
@@ -334,6 +369,8 @@ def prepare_document(root, source, document, args, config):
         if not converted.is_file():
             manifest["converter"] = convert_office(source, converted, config)
             write_json(manifest_path, manifest)
+        if source.suffix.lower() == ".docx":
+            write_gold(root, document, converted.with_suffix(""))
     with pymupdf.open(converted) as converted_pdf:
         count = len(converted_pdf)
     job = (root, converted, document, identity, args, hint_options, recorded)
@@ -391,6 +428,8 @@ def pipeline_setup(name, config, config_dir):
                        "--ocr-lang ja,en --table-mode accurate --image-export-mode referenced")
         elif name == "paddle":
             command = f'{{python}} "{HERE / "datagen" / "paddle_worker.py"}" {{input}} {{output}}'
+        elif name == "ours":  # src/pdf_parser; its model server and vLLM must already be running.
+            command = "{python} -m pdf_parser {input} -o {output}"
         else:
             raise ValueError("Set DOTS_COMMAND for your dots.ocr checkout/server (see .env.example)")
     return venv, shlex.split(command), versions

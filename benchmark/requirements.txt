@@ -6,3 +6,5 @@ numpy>=2,<3
 markdown-it-py>=3,<5
 playwright>=1.50,<2
 python-dotenv>=1,<2
+rapidfuzz>=3,<4
+apted>=1.0.3,<2

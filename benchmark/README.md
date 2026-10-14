@@ -58,9 +58,13 @@ benchmark/
         candidate.png               # rendered candidate
         candidate.pdf               # exactly one page, original physical dimensions
         response.json               # complete model response for inspection
+    gold/doc_name/                  # .docx sources only: Pandoc Markdown of each Word page
+      page_0001.md
+      pages.json                    # per page: header/footer text, PDF agreement, image count
     cache/                          # derived data, kept out of the corpus folders
       input/doc_name.json           # source hash, settings, versions, augment parameters, completion
       convert/doc_name.pdf          # PDF converted from .docx/.pptx, plus its conversion.log
+      convert/doc_name/             # .docx: document.pdf, pages/page_0001.docx, pages.json
       raster/doc_name/page_0001.png # high quality original reference
       hint/doc_name/page_0001.json  # unverified native text + PyMuPDF4LLM Markdown
       parse/mineru/doc_name/
@@ -119,11 +123,19 @@ file, DPI or global seed is rejected for an existing document: use a fresh
 `--io-dir` or rename the raw file so historical parser results stay valid.
 `--convert` is an alias for `--prepare`.
 
-For Office conversion, `CONVERTER_URL` receives a POST with multipart field
-`file` and must return PDF bytes. `CONVERTER_API_KEY` is an optional bearer token.
-If the endpoint is unset, unavailable, or returns an invalid PDF, LibreOffice
-is used with a temporary isolated profile. An endpoint with a different contract
-will need a small adapter once you provide its API details.
+For `.docx`, `CONVERTER_URL` points at the Word server in `docx_converter/server.py`
+(run it on the Windows machine; `CONVERTER_API_KEY` is its `--token`). It returns Word's
+PDF of the whole document plus one DOCX per page Word laid out. If the server is unset or
+unreachable, `docx_converter/libreoffice.py` produces the same output locally; it needs a
+Python with LibreOffice's `uno` module (`LIBREOFFICE_PYTHON`, default `/usr/bin/python3`).
+`.pptx` is converted to PDF by LibreOffice only.
+
+Each page DOCX becomes `gold/<doc>/page_NNNN.md` through Pandoc (`--to=gfm`, the same
+flags as the llm-wiki parser). List numbers are converted to text before splitting, so a
+page keeps `第7条` instead of restarting at 1. `pages.json` records how well each gold page's
+letters and digits match that PDF page's text layer (header/footer text excluded):
+below about 0.98, check for text in images, charts or text boxes that Pandoc cannot see.
+Table header rows repeated on continuation pages are drawn in the PDF but are not page content.
 
 Hints are extracted from each converted PDF page. This keeps DOCX text aligned
 to the actual rendered page; whole-document Pandoc text has no reliable DOCX page
